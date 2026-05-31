@@ -1,0 +1,28 @@
+# Build directories
+build/
+cmake-build-debug/
+cmake-build-release/
+out/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
+logs/
+
+# Compiled binaries
+*.o
+*.a
+*.so
+*.exe
+
+# OS
+.DS_Store
+Thumbs.db
+
+# GitHub token
+.github_pat
+scripts/push_to_github.sh
