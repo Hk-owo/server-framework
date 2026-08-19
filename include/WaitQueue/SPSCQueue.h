@@ -6,6 +6,7 @@
 #define IO_URING_SERVER_WAIT_QUEUE_H
 
 #include "WaitQueue/SPSCBase.h"
+#include <iostream>
 #include <liburing.h>
 
 template<typename T>

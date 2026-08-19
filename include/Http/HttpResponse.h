@@ -5,6 +5,9 @@
 #ifndef WEBPROJECT_HTTPRESPONSE_H
 #define WEBPROJECT_HTTPRESPONSE_H
 
+#include <string>
+#include <unordered_map>
+
 class HttpResponse {
 public:
     // ── 设置接口 ────────────────────────────────────────────────────────────

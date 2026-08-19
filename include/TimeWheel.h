@@ -6,12 +6,10 @@
 #ifndef TIME_WHEEL_TIMEWHEEL_H
 #define TIME_WHEEL_TIMEWHEEL_H
 
-#include "ThreadPool.h"
 #include <atomic>
-#include <mutex>
+#include <memory>
 #include <thread>
 #include <vector>
-#include <list>
 #include <functional>
 #include "liburing.h"
 

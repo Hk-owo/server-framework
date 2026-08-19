@@ -1,6 +1,7 @@
 add_subdirectory(Logger)
 add_subdirectory(ThreadPool)
 add_subdirectory(TimeWheel)
+add_subdirectory(Http)
 add_subdirectory(HttpServer)
 
 add_executable(${PROJECT_NAME} main.cpp)

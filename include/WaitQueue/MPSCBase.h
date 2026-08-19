@@ -5,6 +5,10 @@
 #ifndef WEBPROJECT_MPSCBASE_H
 #define WEBPROJECT_MPSCBASE_H
 
+#include <atomic>
+#include <cstddef>
+#include <utility>
+
 /*
  * MPSC队列 多生产者单消费者
  */

@@ -5,6 +5,13 @@
 #ifndef IO_URING_SERVER_TQUEUE_H
 #define IO_URING_SERVER_TQUEUE_H
 
+#include <atomic>
+#include <cstddef>
+#include <new>
+#include <thread>
+#include <utility>
+#include <vector>
+
 /*
  * 标准的SPSC队列 单生产者单消费者
  * 生产者是主线程

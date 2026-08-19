@@ -26,3 +26,10 @@ Thumbs.db
 # GitHub token
 .github_pat
 scripts/push_to_github.sh
+
+# Docs (benchmark reports, not uploaded)
+docs/
+
+# Reasonix tool state & config
+.reasonix/
+reasonix.toml

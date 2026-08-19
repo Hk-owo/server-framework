@@ -26,9 +26,9 @@
 
   每个 TCP 连接对应一个独立协程，通过 `co_yield` 挂起 IO、`co_await` 组合异步逻辑，代码风格接近同步写法，无需维护复杂的状态机。
 
-- **异步业务处理（QueryAwaiter）**
+- **同步快速路径 + 显式异步**
 
-  HTTP Handler 通过 `QueryAwaiter` 投递到时间轮 / 线程池执行，避免阻塞 io_uring 事件循环。支持 `co_await` 等待后台任务完成后安全恢复协程。
+  HTTP Handler 默认在事件循环线程**同步执行**（零调度开销，适合快任务）；耗时 handler 通过 `GetAsync/PostAsync` 显式注册为异步，经 `QueryAwaiter` 直投全局线程池执行，避免阻塞 io_uring 事件循环。支持 `co_await` 等待后台任务完成后安全恢复协程。
 
 - **eventfd 跨线程协程去重恢复**
 
@@ -38,9 +38,9 @@
 
   事件循环使用 `io_uring_for_each_cqe` + `io_uring_cq_advance` 批量处理完成事件，显著减少内核态切换。
 
-- **负载均衡线程池**
+- **双实例共享队列线程池**
 
-  1 个分发线程 + 8 个工作线程，基于无锁 MPSC/SPSC 队列与负载采样实现任务分发，批量唤醒工作线程，关键变量使用 `alignas(64)` 消除伪共享。
+  全局任务池（8 个工作线程）承载业务任务，时间轮专用池（2 个工作线程）只执行延迟 / 超时等轻量任务，互不干扰。所有 worker 共享一个任务队列，**谁空闲谁取**——任何线程被慢任务拖住都不会导致排队任务无人处理，也不会让其他线程空转。enqueue 无锁、dequeue 消费者互斥，关键变量使用 `alignas(64)` 消除伪共享。
 
 - **四级级联时间轮**
 
@@ -145,19 +145,19 @@ curl -X POST "http://localhost:8080/echo" -d "ping"
     │   每个连接一个协程   │  clientConnect(fd)
     │   co_await READ     │  HttpParser / HttpResponse
     │   co_yield WRITE    │
-    │   co_await Query    │  ← handler 异步执行
+    │   co_await Query    │  ← 仅异步 handler 走线程池
     │   co_yield CLOSE    │
-    └──────────┬──────────┘
-               │ 后台任务 / 延迟回调
-    ┌──────────▼──────────┐
-    │     TimeWheelTop    │  io_uring 1ms 超时驱动
-    │   ms/sec/min/hour   │  级联推进 + 线程池投递
-    └──────────┬──────────┘
-               │
-    ┌──────────▼──────────┐
-    │      ThreadPool     │  1 分发线程 + 8 工作线程
-    │    MPSC / SPSC      │  uring 信号唤醒 / 负载均衡
-    └─────────────────────┘
+    └──────┬─────────┬────┘
+           │业务任务  │ 延迟/超时回调
+    ┌──────▼─────┐  ┌▼──────────────┐
+    │ Global     │  │  TimeWheelTop │
+    │ ThreadPool │  │  级联推进      │
+    │ 8 工作线程 │  └──────┬───────┘
+    │ 共享队列   │         │
+    └────────────┘  ┌──────▼───────────┐
+                   │ TimeWheelThreadPool│
+                   │ 2 工作线程        │
+                   └──────────────────┘
 ```
 
 **事件循环**：单线程 io_uring 批量收取所有 CQE，根据 `OpType` 分发到 `handleCqe` 处理。空队列时以 1ms 超时阻塞等待，既降低 CPU 占用，又精确驱动时间轮。  
@@ -214,7 +214,7 @@ std::string msg = res.build();   // 生成完整 HTTP 报文
 轻量级协程封装（`include/Server/CoroTask.h`），提供 `T` 的泛化版本与 `void` 特化版本。
 
 - `co_yield` 自定义 Awaiter 挂起 IO 操作
-- `co_await` 组合异步逻辑（如 `QueryAwaiter` 延迟执行）
+- `co_await` 组合异步逻辑（如 `QueryAwaiter` 异步投递线程池）
 - `resume()` / `done()` / `get()` 控制协程生命周期
 - `Task<void>::raw_handle()` 获取原始 `std::coroutine_handle<>`，用于外部存储与恢复
 
@@ -224,21 +224,25 @@ std::string msg = res.build();   // 生成完整 HTTP 报文
 
 ```cpp
 co_await QueryAwaiter{server, connState, [&]() {
-    handler(req, res);  // 在后台线程 / 时间轮中执行
+    handler(req, res);  // 在全局线程池后台执行
 }};
 ```
 
 - 利用 `compare_exchange_strong` 设置 `resumePending` 标志，防止同一协程被重复入队
-- 任务通过时间轮延迟 3ms 后执行，既避免事件循环阻塞，又保证极低的响应延迟
+- 业务任务直投全局线程池（8 工作线程）异步执行，经 eventfd 唤醒恢复协程，无固定调度延迟
 
 ### ThreadPool
 
-针对 8 核 CPU 优化的无锁线程池单例。
+线程数可配置的共享队列线程池（N 个工作线程共享一个任务队列），框架内置两个独立实例：
 
-- **1 条 MPSC 分发队列** + **8 条 SPSC 工作队列**
-- 每积累 `BATCH_SIZE(1024)` 个任务批量唤醒工作线程
-- 每 `MINLDX_SIZE(128)` 个任务重新采样队列负载，实现负载均衡
-- 工作线程空队列时通过独立 io_uring 实例阻塞等待，避免忙等
+- `ThreadPool::global_instance()`：**全局任务池**，8 个工作线程，承载业务 handler 等通用任务
+- `ThreadPool::timewheel_instance()`：**时间轮专用池**，2 个工作线程，只执行时间轮到期的轻量任务
+
+调度模型：
+
+- **共享任务队列**：所有 worker 从同一队列取任务，谁空闲谁取，任务不绑定线程——任何线程被慢任务拖住时，排队任务由其他空闲 worker 继续完成，不会饿死或空转
+- **enqueue 无锁**（MPSC 多生产者安全），**dequeue 消费者互斥**（保证节点回收安全，任务在锁外执行）
+- **广播唤醒**：`submit` 入队后唤醒所有空闲 worker 的等待信号，空闲线程全部醒来竞争取任务
 
 ### TimeWheelTop
 
@@ -251,8 +255,8 @@ tw.add_task([]{ /* 延迟任务 */ }, {0, 0, 0, 3});  // 延迟 3ms
 
 - 内部线程以 io_uring 1ms 超时驱动推进
 - 支持追赶机制：若线程滞后，会连续推进直到追上理论时刻
-- 到期任务自动投递到 ThreadPool 执行
-- 延迟小于 3ms 的任务直接投递线程池，避免时间轮精度抖动
+- 到期任务自动投递到时间轮专用线程池执行
+- 延迟小于 3ms 的任务直接投递时间轮专用线程池，避免时间轮精度抖动
 
 ### WaitQueue
 
@@ -260,8 +264,8 @@ tw.add_task([]{ /* 延迟任务 */ }, {0, 0, 0, 3});  // 延迟 3ms
 
 | 类 | 模型 | 容量 | 用途 |
 |----|------|------|------|
-| `SPSCQueue<T>` | 单生产者-单消费者 | 2^21 | 线程池工作线程私有队列 |
-| `MPSCQueue<T>` | 多生产者-单消费者 | 动态链表 | 线程池分发队列、协程恢复队列 |
+| `MPSCQueue<T>` | 多生产者-单消费者 | 动态链表 | 线程池 per-worker 唤醒信号、协程恢复队列 |
+| `MPSCBase<T>` | 多生产者-多消费者（dequeue 加锁） | 动态链表 | 线程池共享任务队列 |
 
 ### Logger
 
@@ -328,9 +332,9 @@ CMake 选项：
 
    每个连接是独立协程，IO 操作通过 `co_yield IouringAwaiter` 挂起，CQE 到达后恢复。无需为每个连接维护复杂的状态机，代码接近同步风格。
 
-2. **QueryAwaiter 异步化业务逻辑**
+2. **同步快速路径 + QueryAwaiter 显式异步**
 
-   HTTP Handler 默认在事件线程执行会阻塞 CQE 消费。通过 `QueryAwaiter` 将 Handler 投递到时间轮 / 线程池，协程 `co_await` 等待完成后自动恢复，实现业务逻辑与 IO 事件的完全解耦。
+   快 handler（字符串拼接、本地查询等）默认在事件循环线程同步执行，无调度开销；慢 handler 通过 `GetAsync/PostAsync` 显式注册，由 `QueryAwaiter` 投递到全局线程池，协程 `co_await` 等待完成后自动恢复，避免阻塞 CQE 消费。
 
 3. **eventfd 跨线程协程去重恢复**
 
@@ -344,13 +348,13 @@ CMake 选项：
 
    事件循环在 CQE 为空时以 1ms 超时阻塞等待，既保证空载时 CPU 占用趋近于零，又精确驱动时间轮推进，无需独立定时线程。
 
-6. **自适应队列等待**
+6. **共享队列与阶梯式等待**
 
-   工作线程在本地队列为空时，通过独立 io_uring 实例做 `peek -> wait` 的阶梯式阻塞，兼顾低延迟与零空闲 CPU 占用。
+   工作线程从共享任务队列取任务，空队列时通过独立 io_uring 实例做 `peek -> wait` 的阶梯式阻塞，兼顾低延迟与零空闲 CPU 占用。
 
-7. **负载均衡与批量唤醒**
+7. **广播唤醒**
 
-   分发线程并非每任务唤醒一次，而是每 1024 个任务批量 `on_data_ready_uring()`，显著减少内核态切换与缓存抖动。
+   `submit` 入队后广播唤醒所有空闲 worker 的等待信号，空闲线程全部醒来竞争取任务；任何线程被慢任务拖住时，其余 worker 继续消化共享队列，不会空转。
 
 8. **时间轮级联与短延迟兜底**
 
@@ -364,22 +368,26 @@ CMake 选项：
 include/
 ├── Server/
 │   ├── Server.h          # io_uring HTTP 服务器主类
-│   ├── HttpParser.h      # HTTP/1.1 请求解析器
-│   ├── HttpResponse.h    # HTTP 响应构造器
+│   ├── Router.h          # 路由表（GET/POST 注册与匹配）
 │   ├── HttpServer.h      # 业务层 Dashboard HTTP 服务器
 │   └── CoroTask.h        # C++23 协程 Task<T>
+├── Http/
+│   ├── HttpParser.h      # HTTP/1.1 请求解析器
+│   └── HttpResponse.h    # HTTP 响应构造器
 ├── WaitQueue/
 │   ├── SPSCBase.h / SPSCQueue.h   # 无锁 SPSC 队列 + uring 唤醒
 │   └── MPSCBase.h / MPSCQueue.h   # 无锁 MPSC 队列 + uring 唤醒
-├── ThreadPool.h          # 负载均衡线程池
+├── ThreadPool.h          # 共享队列线程池
 ├── TimeWheel.h           # 四级时间轮
 ├── Logger.h              # spdlog 异步日志封装
 └── DataBaseQuery/        # 数据层（连接池、查询封装、缓存管理）
 src/
-├── HttpServer/
-│   ├── Server.cpp        # Server 实现
+├── Http/
 │   ├── HttpParser.cpp    # 解析器实现
-│   ├── HttpResponse.cpp  # 响应构造实现
+│   └── HttpResponse.cpp  # 响应构造实现
+├── HttpServer/
+│   ├── Server.cpp        # Server 实现（含 ConnCtx / awaiter 实现）
+│   ├── Router.cpp        # 路由匹配实现
 │   └── Httpserver.cpp    # HttpServer 业务层实现
 ├── ThreadPool/
 │   └── ThreadPool.cpp

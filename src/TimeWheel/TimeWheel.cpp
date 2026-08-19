@@ -4,6 +4,7 @@
 //
 
 #include "TimeWheel.h"
+#include "ThreadPool.h"
 #include "Logger.h"
 
 using namespace std;
@@ -51,7 +52,7 @@ void TimeWheel::advance() {
     }
     for (auto& node : fired)
         if (node.task)
-            ThreadPool::get_instance().submit(std::move(node.task));
+            ThreadPool::timewheel_instance().submit(std::move(node.task));
 }
 
 // 高级轮：到期任务级联到低一级轮
@@ -73,7 +74,7 @@ void TimeWheel::advance(TimeWheel* lower) {
         if (!node.task) continue;
         if (node.time == 0)
             // 残余时间为 0：已到期，直接投
-            ThreadPool::get_instance().submit(std::move(node.task));
+            ThreadPool::timewheel_instance().submit(std::move(node.task));
         else
             lower->add_task(std::move(node.task), node.time);
     }
@@ -178,7 +179,7 @@ void TimeWheelTop::add_task(std::function<void()> task, DelayTime delayTime) {
     // run_time < 3：当前槽和紧邻下一槽可能正在推进，
     // 用精度换线程安全，直接投线程池
     if (run_time < 3) {
-        ThreadPool::get_instance().submit(std::move(task));
+        ThreadPool::timewheel_instance().submit(std::move(task));
         return;
     }
 

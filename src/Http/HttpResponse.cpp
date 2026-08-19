@@ -2,7 +2,11 @@
 // Created by lacas on 2026/3/18.
 //
 
-#include "Server/HttpResponse.h"
+#include "Http/HttpResponse.h"
+
+#include <sstream>
+#include <stdexcept>
+#include <utility>
 
 // ── 设置接口实现 ───────────────────────────────────────────────────────────
 

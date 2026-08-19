@@ -5,6 +5,12 @@
 #ifndef WEBPROJECT_HTTPPARSER_H
 #define WEBPROJECT_HTTPPARSER_H
 
+#include <cstddef>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
 
 namespace HttpUtils {
     void to_lower(std::string& s);

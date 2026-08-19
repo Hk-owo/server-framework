@@ -3,7 +3,12 @@
 //
 
 #include "Server/HttpServer.h"
+#include "Http/HttpParser.h"
+#include "Http/HttpResponse.h"
 #include "Logger.h"
+
+#include <chrono>
+#include <thread>
 
 using namespace std;
 
@@ -66,6 +71,15 @@ void HttpServer::registerRoutes() {
         (void)req;
         res.set_status(200)
            .set_json(R"({"success":true,"data":{"uptime":"running","version":"1.0.0"}})");
+    });
+
+    // GET /async/status — 异步 handler 示例（GetAsync 注册，投全局线程池执行）
+    // 模拟耗时任务：sleep 1ms 后返回，不阻塞 io_uring 事件循环
+    server.GetAsync("/async/status", [](const HttpRequest& req, HttpResponse& res) {
+        (void)req;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        res.set_status(200)
+           .set_json(R"({"success":true,"data":{"mode":"async","threadpool":"global"}})");
     });
 
     // GET /api/user/{id} — 前缀匹配示例

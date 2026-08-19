@@ -2,7 +2,14 @@
 // Created by lacas on 2026/3/18.
 //
 
-#include "Server/HttpParser.h"
+#include "Http/HttpParser.h"
+
+#include <algorithm>
+#include <cctype>
+#include <charconv>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
 
 // ==================== HttpUtils 实现 ====================
 

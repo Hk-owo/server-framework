@@ -2,16 +2,101 @@
 // Created by lacas on 2026/3/18.
 //
 
-#include "HtmlContent.h"
 #include "Server/Server.h"
+#include "Server/Router.h"
+#include "Http/HttpParser.h"
+#include "Http/HttpResponse.h"
+#include "ThreadPool.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <cassert>
+#include <cerrno>
+#include <atomic>
+#include <optional>
 #include "Logger.h"
 #include "liburing.h"
 
 using namespace std;
+
+// ── ConnCtx ──────────────────────────────────────────────────
+// 连接上下文：单连接的 IO 状态（读写缓冲、短写续传偏移、协程句柄）
+struct Server::ConnCtx {
+    OpType  status;
+    int     fd;
+    std::string* buffer       = nullptr;
+    ssize_t      bytes_read   = 0;
+    size_t       write_offset = 0;       // 短写续传偏移
+
+    std::atomic<bool> resumePending{false};
+    std::optional<coro::Task<void>> task;
+    std::coroutine_handle<>         handle;
+
+    ConnCtx(OpType status, int fd, std::string* buffer)
+            : status(status), fd(fd), buffer(buffer), task(std::nullopt) {}
+};
+
+// ── IouringAwaiter ───────────────────────────────────────────
+// co_await 挂起时向 io_uring 提交对应的 IO 请求，完成事件到达后由事件循环恢复协程
+struct Server::IouringAwaiter {
+    Server*                  server;
+    std::coroutine_handle<>* handle_ptr;
+    Server::ConnCtx*         connState;
+    std::string*             buffer = nullptr;   // CLOSE 时为 nullptr，显式默认
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> h) {
+        *handle_ptr = h;
+        LOGGER_INF("await_suspend: status={} fd={} handle={}",
+                   (int)connState->status, connState->fd, (void*)h.address());
+
+        switch (connState->status) {
+            case OpType::READ:
+                assert(buffer != nullptr);
+                server->submitRecv(connState->fd, *buffer, *connState);
+                break;
+            case OpType::WRITE:
+                assert(buffer != nullptr);
+                server->submitWrite(connState->fd, *buffer, *connState);
+                break;
+            case OpType::CLOSE:
+                server->submitClose(connState->fd, *connState);
+                break;
+            default:
+                break;
+        }
+    }
+    void await_resume() const noexcept {}
+};
+
+// ── QueryAwaiter ─────────────────────────────────────────────
+// co_await 时将业务 handler 投递到全局线程池异步执行，
+// 完成后经 eventfd 唤醒事件循环恢复协程；resumePending CAS 防止重复入队
+struct Server::QueryAwaiter{
+    Server* server;
+    ConnCtx* connState;
+    std::function<void()> callback;
+    bool await_ready() const noexcept { return false; }
+    void await_resume() const noexcept {}
+    void await_suspend(std::coroutine_handle<> h) {
+        auto* ctx = connState; // ConnCtx*
+        std::function<void()> task =
+                [h, s = server, cb = std::move(callback), ctx] mutable {
+                    try { cb(); } catch (...) {}
+                    bool expected = false;
+                    if (ctx->resumePending.compare_exchange_strong(expected, true,
+                                                                   std::memory_order_acq_rel)) {
+                        auto item = std::make_pair(h, ctx);
+                        s->mPendingResumes.enqueue(item);
+                        uint64_t v = 1;
+                        int ret = write(s->mEventFd, &v, sizeof(v));
+                        LOGGER_INF("write eventfd ret={} errno={}", ret, errno);
+                    }
+                };
+        // 业务任务直投全局线程池：不经时间轮、无固定延迟
+        ThreadPool::global_instance().submit(std::move(task));
+    }
+};
 
 int Server::listen(const std::string &bind, const std::string& port) {
     struct addrinfo hints, *res;
@@ -213,22 +298,21 @@ Server::Server() : mSockFd(-1) {
 Server::~Server() {
     io_uring_queue_exit(&ring);
 }
-void Server::Get(std::string pattern, std::function<void(const HttpRequest& req, HttpResponse& res)> handler) {
-    // 确保路径以/开头
-    if (pattern.empty() || pattern[0] != '/') {
-        pattern = "/" + pattern;
-    }
+void Server::Get(std::string pattern, Router::Handler handler) {
     LOGGER_INF("Register GET handler for: {}", pattern);
-    mGetHandler[std::move(pattern)] = std::move(handler);
+    mRouter.Get(std::move(pattern), std::move(handler));
 }
-void Server::Post(std::string pattern, std::function<void(const HttpRequest& req, HttpResponse& res)> handler) {
-    // 确保路径以/开头
-    if (pattern.empty() || pattern[0] != '/') {
-        pattern = "/" + pattern;
-    }
-
+void Server::Post(std::string pattern, Router::Handler handler) {
     LOGGER_INF("Register POST handler for: {}", pattern);
-    mPostHandler[std::move(pattern)] = std::move(handler);
+    mRouter.Post(std::move(pattern), std::move(handler));
+}
+void Server::GetAsync(std::string pattern, Router::Handler handler) {
+    LOGGER_INF("Register ASYNC GET handler for: {}", pattern);
+    mRouter.GetAsync(std::move(pattern), std::move(handler));
+}
+void Server::PostAsync(std::string pattern, Router::Handler handler) {
+    LOGGER_INF("Register ASYNC POST handler for: {}", pattern);
+    mRouter.PostAsync(std::move(pattern), std::move(handler));
 }
 
 int Server::submitMultishotAccept() {
@@ -347,51 +431,25 @@ coro::Task<void> Server::clientConnect(int fd, ConnCtx* connState) {
                 HttpRequest& req = *optReq;
                 httpResponse = HttpResponse();
 
+                // 路由匹配（精确 + 前缀）由 Router 负责，执行分两条路径：
+                //   同步快路径（默认）：handler 直接在事件循环线程执行，零调度开销
+                //   异步慢路径：Route::async 时经 QueryAwaiter 投全局线程池，防阻塞
                 bool hit = false;
-                const auto& path = req.parsed_uri().path;
-
-                if (req.method == "GET") {
-                    if (auto it = mGetHandler.find(path); it != mGetHandler.end()) {
-                        auto handler = it->second;
+                Router::Route route;
+                if (mRouter.match(req, route)) {
+                    if (route.async) {
                         HttpRequest  reqSnap = req;
                         auto resSnap = std::make_shared<HttpResponse>();
                         co_await QueryAwaiter{this, connState,
-                                              [handler, reqSnap = std::move(reqSnap), resSnap]() mutable {
+                                              [handler = route.handler, reqSnap = std::move(reqSnap), resSnap]() mutable {
                                                   handler(reqSnap, *resSnap);
                                               }
                         };
                         httpResponse = std::move(*resSnap);
-                        hit = true;
                     } else {
-                        for (auto& [pattern, handler] : mGetHandler) {
-                            if (pattern.back() == '/' && path.rfind(pattern, 0) == 0) {
-                                auto handlerCopy = handler;
-                                HttpRequest  reqSnap = req;
-                                auto resSnap = std::make_shared<HttpResponse>();
-                                co_await QueryAwaiter{this, connState,
-                                                      [handlerCopy, reqSnap = std::move(reqSnap), resSnap]() mutable {
-                                                          handlerCopy(reqSnap, *resSnap);
-                                                      }
-                                };
-                                httpResponse = std::move(*resSnap);
-                                hit = true;
-                                break;
-                            }
-                        }
+                        route.handler(req, httpResponse);   // 同步快速路径
                     }
-                } else if (req.method == "POST") {
-                    if (auto it = mPostHandler.find(path); it != mPostHandler.end()) {
-                        auto handler = it->second;
-                        HttpRequest  reqSnap = req;
-                        auto resSnap = std::make_shared<HttpResponse>();
-                        co_await QueryAwaiter{this, connState,
-                                              [handler, reqSnap = std::move(reqSnap), resSnap]() mutable {
-                                                  handler(reqSnap, *resSnap);
-                                              }
-                        };
-                        httpResponse = std::move(*resSnap);
-                        hit = true;
-                    }
+                    hit = true;
                 }
 
                 if (!hit) {
