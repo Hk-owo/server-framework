@@ -56,7 +56,7 @@ void TimeWheel::advance() {
 }
 
 // 高级轮：到期任务级联到低一级轮
-void TimeWheel::advance(TimeWheel* lower) {
+void TimeWheel::advance(TimeWheel& lower) {
     uint idx = nowIndex.fetch_add(1, memory_order_relaxed);
     if (idx >= mSize) {
         nowIndex.store(0, memory_order_relaxed);
@@ -76,7 +76,7 @@ void TimeWheel::advance(TimeWheel* lower) {
             // 残余时间为 0：已到期，直接投
             ThreadPool::timewheel_instance().submit(std::move(node.task));
         else
-            lower->add_task(std::move(node.task), node.time);
+            lower.add_task(std::move(node.task), node.time);
     }
 }
 
@@ -120,9 +120,9 @@ TimeWheelTop::TimeWheelTop() {
                 if (expected >= maxMs) expected = 0;
 
                 mSubWheel[0]->advance();                                // 每 ms
-                if (expected % 1000  == 0) mSubWheel[1]->advance(mSubWheel[0].get()); // 每秒
-                if (expected % 60000 == 0) mSubWheel[2]->advance(mSubWheel[1].get()); // 每分
-                if (expected % maxMs == 0) mSubWheel[3]->advance(mSubWheel[2].get()); // 每时
+                if (expected % 1000  == 0) mSubWheel[1]->advance(*mSubWheel[0]); // 每秒
+                if (expected % 60000 == 0) mSubWheel[2]->advance(*mSubWheel[1]); // 每分
+                if (expected % maxMs == 0) mSubWheel[3]->advance(*mSubWheel[2]); // 每时
             } while (expected < target);
         }
     });
@@ -143,6 +143,26 @@ void TimeWheelTop::add_task(std::function<void()> task, DelayTime delayTime) {
     uint secNow = mSubWheel[1]->nowIndex.load(memory_order_relaxed);
     uint minNow = mSubWheel[2]->nowIndex.load(memory_order_relaxed);
     uint hrNow  = mSubWheel[3]->nowIndex.load(memory_order_relaxed);
+
+    // 先扣掉一个最小刻度：advance 的语义是"取出当前指针指向的槽、再把指针前进"，
+    // 所以从当前槽走到 slot[now+delay] 实际需要 delay+1 次推进。
+    // 不扣的话跨轮会晚一整格：ms 轮晚 1ms、秒轮晚 1 秒、分轮晚 1 分。
+    // 延迟全为 0 时不扣，保持"尽快执行"的语义
+    if (delayTime.millisecond > 0) {
+        delayTime.millisecond -= 1;
+    } else if (delayTime.second > 0) {
+        delayTime.second -= 1;
+        delayTime.millisecond = 999;
+    } else if (delayTime.minute > 0) {
+        delayTime.minute -= 1;
+        delayTime.second = 59;
+        delayTime.millisecond = 999;
+    } else if (delayTime.hour > 0) {
+        delayTime.hour -= 1;
+        delayTime.minute = 59;
+        delayTime.second = 59;
+        delayTime.millisecond = 999;
+    }
 
     // 加上当前指针偏移，计算绝对槽位
     delayTime.millisecond += msNow;

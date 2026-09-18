@@ -8,7 +8,9 @@
 #include "Router.h"
 #include "CoroTask.h"
 #include "WaitQueue/MPSCQueue.h"
+#include "TimeWheel.h"
 
+#include <atomic>
 #include <coroutine>
 #include <cstdint>
 #include <memory>
@@ -30,10 +32,21 @@ private:
     io_uring ring;
     int mSockFd,mEventFd;
     uint64_t mEventVal = 0;
-    MPSCQueue<std::pair<std::coroutine_handle<>, ConnCtx*>> mPendingResumes;
-    std::vector<int> mPendingClose;
+    // 待恢复的协程：只弱引用连接。不换的话工作线程会拿着可能已被回收的连接去恢复协程
+    MPSCQueue<std::pair<std::coroutine_handle<>, std::weak_ptr<ConnCtx>>> mPendingResumes;
     std::unordered_map<int,std::shared_ptr<ConnCtx>> mConnections;
     Router mRouter;
+    // 四级级联时间轮：用来驱动连接的空闲超时（见 scanIdle）
+    TimeWheelTop mTimeWheel;
+    // 时间轮线程跨线程只置这个标志 + 写 eventfd，真正的扫描在事件循环线程做
+    std::atomic<bool> mScanRequested{false};
+
+private:
+    // 扫描并回收空闲超时的连接（只在事件循环线程调用）
+    void scanIdle();
+    // 向时间轮注册下一次空闲扫描（每秒一次，自我重注册）
+    void scheduleScan();
+
 public:
     int listen(const std::string& bind,const std::string& port);
     void run(unsigned entries = 4096, unsigned flags = 0);
@@ -45,7 +58,7 @@ public:
     Server();
     ~Server();
     int submitMultishotAccept();
-    coro::Task<void> clientConnect(int clifd,ConnCtx* connCtx);
+    coro::Task<void> clientConnect(std::weak_ptr<ConnCtx> connWeak);
     void submitRecv(int fd, std::string &buffer,ConnCtx& connCtx);
     void submitWrite(int fd, std::string &msg, ConnCtx &connCtx);
     void submitClose(int fd, ConnCtx &connCtx);
@@ -53,6 +66,7 @@ public:
 
     void submitEventFdRead();
 
+    // connCtx 由 io_uring 的 user_data 带回（交给内核的指针保持原样）
     void handleCqe(ConnCtx *connCtx, int res, unsigned int cflags);
 };
 

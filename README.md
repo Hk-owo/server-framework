@@ -1,66 +1,32 @@
+# ServerFramework
 
-# 基于 Linux io_uring 与 C++23 协程的高性能 HTTP 服务器框架
+**基于 Linux io_uring 与 C++23 协程的 HTTP 服务器框架 —— 单线程事件循环 + 无锁 MPMC 任务队列。**
 
----
-
-## 目录
-
-- [项目特性](#项目特性)
-- [快速开始](#快速开始)
-- [系统架构](#系统架构)
-- [核心模块](#核心模块)
-- [编译构建](#编译构建)
-- [API 参考](#api-参考)
-- [设计亮点](#设计亮点)
-- [目录结构](#目录结构)
+每个 TCP 连接对应一个独立协程：`co_await` 时向 io_uring 提交 IO 并挂起，CQE 到达后由事件循环恢复，代码写法接近同步、没有状态机。Accept / Recv / Send / Close / Poll 全链路作为 SQE 提交，连接建立用 multishot accept 一次提交持续接收，完成事件按批消费。业务 handler 默认在事件循环线程**同步执行**（零调度开销），耗时任务通过 `GetAsync`/`PostAsync` 显式投递到线程池；线程池的任务队列是一条**槽位序号环形 MPMC 队列**，worker 空闲时直接挂在队列自带的 io_uring ring 上阻塞，空载时全部停在 `io_cqring_wait`，不消耗空转 CPU。
 
 ---
 
-## 项目特性
+## 亮点
 
-- **io_uring 全链路异步**
+- **全链路 io_uring** —— accept / recv / send / close / poll 全部作为 SQE 提交，不为 IO 建立任何线程；multishot accept 一次提交即可持续接收新连接；事件循环用 `io_uring_for_each_cqe` 批量遍历完成队列、`io_uring_cq_advance` 一次性标记消费，减少内核态往返。
 
-  Accept / Recv / Send / Close / Poll 均通过 io_uring 提交，减少系统调用与线程切换开销。支持 **Multishot Accept**，一次提交即可持续接收新连接。
+- **C++23 协程连接模型** —— 每个连接一个协程，读写通过 `co_await IouringAwaiter{...}` 挂起，`await_suspend` 提交对应 IO，CQE 回到事件循环后恢复。协程帧挂在连接对象里，连接回收即协程结束，不需要状态机或回调金字塔。
 
-- **C++23 协程连接模型**
+- **同步快速路径 + 显式异步** —— `server.Get(...)` 注册的 handler **直接在事件循环线程执行**：没有任务入队、没有线程唤醒、没有跨线程协程恢复。实测单核约 7.6 万 req/s（`/json`，8 线程 500 连接时约 9.1 万）。耗时 handler 用 `GetAsync`/`PostAsync` 注册，`QueryAwaiter` 把任务投进全局线程池，后台线程完成后经 `eventfd` 唤醒事件循环恢复协程；`resumePending` 的 CAS 保证同一协程不会被重复入队。
 
-  每个 TCP 连接对应一个独立协程，通过 `co_yield` 挂起 IO、`co_await` 组合异步逻辑，代码风格接近同步写法，无需维护复杂的状态机。
+- **无锁 MPMC 任务队列** —— 所有 worker 共享一条任务队列、谁空闲谁取，因此任何线程被慢任务拖住都不会让排队任务无人处理。队列用**槽位序号**判定归属：入队者等到 `sequence == pos` 才写入，出队者等到 `sequence == pos + 1` 才取走，取走后把序号推到下一圈。多生产者多消费者都不需要锁，内存一次分配、槽位循环复用——**没有节点回收，也就没有 use-after-free**。
 
-- **同步快速路径 + 显式异步**
+- **阻塞等待内建在队列里** —— worker 队列取空后挂在**队列自己的 io_uring ring** 上等待，而不是忙等轮询。多消费者等待需要两道保障：等待者用**计数器**登记（单布尔会被最后一个退出者清掉，导致其余等待者再也等不到唤醒）、CQE 用 **CAS 原子认领**（liburing 的 `io_uring_cqe_seen` 实现是 `*khead = *khead + 1`，并发消费会丢更新并把 CQ 的 head 推错）。
 
-  HTTP Handler 默认在事件循环线程**同步执行**（零调度开销，适合快任务）；耗时 handler 通过 `GetAsync/PostAsync` 显式注册为异步，经 `QueryAwaiter` 直投全局线程池执行，避免阻塞 io_uring 事件循环。支持 `co_await` 等待后台任务完成后安全恢复协程。
+- **连接生命周期用弱引用** —— 连接表独占持有连接对象，**所有跨线程或跨生命周期边界的引用都是 `weak_ptr`**：投进线程池的异步任务、待恢复协程队列都在取用时 `lock()` 确认存活，拿不到就丢弃。协程内部则用裸指针——连接持有协程帧，所以"协程在跑"就蕴含"连接活着"；这个不变式不能改用 `shared_ptr` 表达，否则连接与协程帧会互相持有成环。
 
-- **eventfd 跨线程协程去重恢复**
+- **身份用对象而不是 fd** —— 每个 CQE 都先"回表"取一份 `shared_ptr` 保活，并**用指针值确认身份**（`it->second.get() == connCtx`），而不是只信 fd。因为 fd 是进程 fdtable 的**下标**，内核按"最小可用"分配（POSIX 要求），`close` 之后**立刻**可被下一次 `accept` 复用——同一批 CQE 里完全可能出现 `close(22)` 之后新连接又拿到 `22`，此时按 fd 删除就会删错对象。
 
-  后台线程完成任务后通过 `eventfd` 唤醒主循环；`compare_exchange_strong` 保证同一协程不会被重复入队，防止竞态。
+- **时间轮驱动的空闲超时** —— 四级级联时间轮（`ms → sec → min → hour`，最小刻度 1ms，由独立的 io_uring 1ms 超时驱动并带追赶机制）。当前接入点是**连接空闲超时**：时间轮每秒唤醒一次事件循环，扫描连接表回收"服务器在等客户端却一直等不到"的连接（阈值 5s），避免一个连上却不发数据的客户端永久占住 fd 和 64KB 读缓冲。关闭前先 `shutdown(fd, SHUT_RDWR)`——连接上那条未完成的 `recv` 持有 socket 引用，只提交 `close` 的话 fd 会被摘掉而 socket 并不真正闭合，FIN 发不出去。
 
-- **批量 CQE 消费**
+- **HTTP/1.1 完整实现** —— 请求行与 Header 解析、URI Query 自动解码、`Content-Length` 与 `Chunked Transfer-Encoding`、Keep-Alive 长连接；发送侧支持**短写续传**（记录断点，上层业务无感知）。
 
-  事件循环使用 `io_uring_for_each_cqe` + `io_uring_cq_advance` 批量处理完成事件，显著减少内核态切换。
-
-- **双实例共享队列线程池**
-
-  全局任务池（8 个工作线程）承载业务任务，时间轮专用池（2 个工作线程）只执行延迟 / 超时等轻量任务，互不干扰。所有 worker 共享一个任务队列，**谁空闲谁取**——任何线程被慢任务拖住都不会导致排队任务无人处理，也不会让其他线程空转。enqueue 无锁、dequeue 消费者互斥，关键变量使用 `alignas(64)` 消除伪共享。
-
-- **四级级联时间轮**
-
-  毫秒级精度的 `ms -> sec -> min -> hour` 级联时间轮，用于延迟任务调度与协程超时控制。由 io_uring 1ms 超时驱动，支持追赶机制。
-
-- **HTTP/1.1 协议支持**
-
-  完整支持请求行与 Header 解析、URI Query 自动解码、`Content-Length` 与 `Chunked Transfer-Encoding`、Keep-Alive 长连接。
-
-- **短写自动续传**
-
-  Send 未完全发送时自动记录 `write_offset`，下次从断点继续发送，上层业务无感知。
-
-- **异步日志**
-
-  基于 `spdlog` 的异步 Logger，支持控制台彩色输出与按大小轮转的日志文件，提供 Trace / Debug / Info / Warn / Error / Critical 六级日志。
-
-- **分层数据层**
-
-  MySQL 连接池 + Redis 连接池，Cache-Aside 缓存策略，QueryResult&lt;T&gt; 统一结果包装。
+- **异步滚动日志** —— spdlog 异步 logger，只挂滚动文件 sink（每个 10MB、保留 5 个），不向 stdout 输出，因此即便把进程 stdout 重定向到文件也不会产生无限增长的日志。
 
 ---
 
@@ -68,342 +34,230 @@
 
 ### 环境要求
 
-| 项目 | 版本要求 |
-|------|----------|
-| 操作系统 | Linux 内核 >= 5.10（推荐 >= 6.0 以完整支持 multishot accept） |
+| 项目 | 要求 |
+|------|------|
+| 操作系统 | Linux 内核 ≥ 5.10（推荐 ≥ 6.0 以完整支持 multishot accept） |
 | 编译器 | 支持 C++23 的 GCC 或 Clang |
-| 依赖库 | `liburing`、`spdlog`、`fmt`、`nlohmann-json` |
+| 依赖 | `liburing`、`spdlog`、`fmt`、`nlohmann-json` |
+| 构建 | CMake ≥ 3.20 |
+
+### 构建与运行
+
+```bash
+cmake -S . -B build/Release -DCMAKE_BUILD_TYPE=Release
+cmake --build build/Release -j$(nproc)
+
+cd build/Release/bin && ./WebProject      # 监听 0.0.0.0:8080
+```
 
 ### 最小示例
 
 ```cpp
 #include "Server/Server.h"
-#include "Logger.h"
 
 int main() {
-    Logger::init("Demo", "../logs/demo.log");
-
     Server srv;
 
+    // 同步快速路径：直接在事件循环线程执行，零调度开销
     srv.Get("/hello", [](const HttpRequest& req, HttpResponse& res) {
         auto name = req.get_param_value("name");
-        res.set_status(200)
-           .set_body("Hello, " + (name.empty() ? "World" : name));
+        res.set_status(200).set_body("Hello, " + (name.empty() ? "World" : name));
     });
 
-    srv.Post("/echo", [](const HttpRequest& req, HttpResponse& res) {
-        res.set_status(200).set_body(req.body);
+    // 异步路径：投递全局线程池，不阻塞事件循环
+    srv.GetAsync("/slow", [](const HttpRequest& req, HttpResponse& res) {
+        // 这里可以放数据库查询、外部调用等耗时操作
+        res.set_status(200).set_json(R"({"ok":true})");
     });
 
     if (srv.listen("0.0.0.0", "8080") != 0) return 1;
-    srv.run();  // 进入阻塞事件循环
-    return 0;
+    srv.run();   // 进入阻塞事件循环
 }
 ```
 
-### 业务层快速启动（HttpServer）
-
-```cpp
-#include "Server/HttpServer.h"
-
-int main() {
-    HttpServer httpServer;  // 自动注册路由、启动监听、进入事件循环
-    return 0;
-}
-```
-
-`HttpServer` 内置完整的 Dashboard REST API（登录鉴权、订单管理、会员查询等），基于 Redis Token 鉴权与 MySQL 数据层。
-
-### 编译运行
+### 压测
 
 ```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-```
-
-### 测试验证
-
-```bash
-curl "http://localhost:8080/hello?name=GitHub"
-curl -X POST "http://localhost:8080/echo" -d "ping"
+./tests/scripts/benchmark.sh --duration 10s     # 分级压测，自动起停服务器并汇总
 ```
 
 ---
 
-## 系统架构
+## 架构
 
 ```
-┌─────────────────────────────────────────────┐
-│          单线程 io_uring 事件循环            │
-│   io_uring_for_each_cqe → handleCqe         │
-│   io_uring_cq_advance → 批量标记已消费       │
-│   1ms 超时唤醒 → 驱动 TimeWheel              │
-└──────────────┬──────────────────────────────┘
-               │ CQE 唤醒
-    ┌──────────▼──────────┐
-    │   每个连接一个协程   │  clientConnect(fd)
-    │   co_await READ     │  HttpParser / HttpResponse
-    │   co_yield WRITE    │
-    │   co_await Query    │  ← 仅异步 handler 走线程池
-    │   co_yield CLOSE    │
-    └──────┬─────────┬────┘
-           │业务任务  │ 延迟/超时回调
-    ┌──────▼─────┐  ┌▼──────────────┐
-    │ Global     │  │  TimeWheelTop │
-    │ ThreadPool │  │  级联推进      │
-    │ 8 工作线程 │  └──────┬───────┘
-    │ 共享队列   │         │
-    └────────────┘  ┌──────▼───────────┐
-                   │ TimeWheelThreadPool│
-                   │ 2 工作线程        │
-                   └──────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│ 业务层  HttpServer        src/HttpServer/Httpserver.cpp            │
+│         注册路由 → 构造 Server → listen → run（阻塞不返回）         │
+├────────────────────────────────────────────────────────────────────┤
+│ 路由层  Router            include/Server/Router.h                  │
+│         精确匹配 + 目录前缀匹配；只负责"匹配"不负责"执行"            │
+│         产物 Route{handler, async} 决定走同步还是异步路径           │
+├────────────────────────────────────────────────────────────────────┤
+│ 服务层  Server            src/HttpServer/Server.cpp                │
+│         单线程 io_uring 事件循环 + 每连接一个协程                   │
+│         ConnCtx / IouringAwaiter / QueryAwaiter                    │
+│         状态：mConnections / mPendingResumes / mTimeWheel / mEventFd│
+├────────────────────────────────────────────────────────────────────┤
+│ 协议层  HttpParser / HttpResponse                                 │
+├────────────────────────────────────────────────────────────────────┤
+│ 基础设施 ThreadPool(global 8 / timewheel 2) · TimeWheelTop ·      │
+│          Logger(spdlog 异步 + 滚动文件)                             │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
-**事件循环**：单线程 io_uring 批量收取所有 CQE，根据 `OpType` 分发到 `handleCqe` 处理。空队列时以 1ms 超时阻塞等待，既降低 CPU 占用，又精确驱动时间轮。  
-**协程模型**：每个连接一个 `coro::Task<void>`，通过自定义 `IouringAwaiter` 挂起 IO，`QueryAwaiter` 将业务逻辑异步化。  
-**跨线程协程恢复**：后台线程通过 **eventfd + MPSCQueue** 将协程句柄带回主循环；`resumePending` CAS 标志防止重复入队，确保线程安全。
+### 一条请求的完整链路
+
+```
+accept (multishot CQE)
+  └─ 建 ConnCtx → 启动连接协程
+       └─ co_await IouringAwaiter{READ}            ← 挂起，提交 recv
+            CQE 到达 → handleCqe → 恢复协程
+              ├─ 解析：HttpParser.feed + try_parse
+              ├─ 路由：Router.match
+              ├─ 执行：同步 handler 直接调用
+              │        异步 handler → co_await QueryAwaiter
+              │                        └─ 投线程池 → handler 执行
+              │                          → CAS resumePending → 入队 + write(eventfd)
+              │                          → 事件循环 poll 到 → 恢复协程
+              └─ co_yield IouringAwaiter{WRITE}   ← 提交 send（短写续传）
+       └─ co_await IouringAwaiter{CLOSE}          ← 提交 close
+```
 
 ---
 
-## 核心模块
+## 核心机制
 
-### Server
+### 任务队列：槽位序号环形队列
 
-框架主类，封装 io_uring 生命周期、路由注册、协程调度与 CQE 分发。
+队列预分配一组**槽位**，每个槽位带一个 `sequence` 序号：
 
-| 接口 | 说明 |
-|------|------|
-| `listen(bind, port)` | 创建 socket、绑定地址、开始监听 |
-| `run(entries, flags)` | 初始化 io_uring 并进入事件循环 |
-| `Get(pattern, handler)` | 注册 GET 路由（支持 `/prefix/` 前缀匹配） |
-| `Post(pattern, handler)` | 注册 POST 路由 |
-| `handleCqe(ctx, res, cflags)` | 独立 CQE 处理函数，解耦事件循环与业务逻辑 |
+| 角色 | 条件 | 动作 |
+|------|------|------|
+| 入队者 | 槽位 `sequence == pos` | CAS 抢占 `tail`，写入数据，把 `sequence` 发布为 `pos + 1` |
+| 出队者 | 槽位 `sequence == pos + 1` | CAS 抢占 `head`，取走数据，把 `sequence` 发布为 `pos + QSIZE` |
 
-### HttpParser
+序号既是"数据是否就绪"的标志，也是"槽位轮到谁"的凭证，因此多个生产者与多个消费者可以并发操作同一条队列而不需要任何锁；槽位循环复用，全程没有节点分配与回收。
 
-流式 HTTP/1.1 请求解析器。
+另外，`enqueue` 在队列满时自旋让出而非失败，保持"提交一定能进队列"的语义。
 
-```cpp
-HttpParser parser;
-parser.feed(buffer, n);
-if (auto req = parser.try_parse()) {
-    // req->method, req->uri, req->headers, req->body
-    auto param = req->get_param_value("key");
-}
+### worker 的阻塞与唤醒
+
+队列自带一条 io_uring ring 作为唤醒通道：
+
+- 提交侧：入队后若仍有等待者，提交一个 nop——**必须 `io_uring_prep_nop`**，否则这个 sqe 会带着残留 opcode 提交，唤醒事件不成立。
+- 消费侧：`io_uring_enter(GETEVENTS)` 阻塞等待，被唤醒后回来排空队列（谁空闲谁取）。
+
+多消费者场景下 `io_uring_wait_cqe` 不保证一个 CQE 只交给一个等待者，所以唤醒事件由消费者用 CAS 自行认领，而不是依赖 liburing 的 `cqe_seen`。
+
+### 连接的所有权、引用与身份
+
+| 角色 | 持有方式 | 理由 |
+|------|---------|------|
+| `mConnections`（连接表） | `shared_ptr<ConnCtx>` | 唯一强引用 |
+| 协程内部 | 裸指针 | 连接持有协程帧 ⇒ 协程在跑则连接必活 |
+| `IouringAwaiter` / `QueryAwaiter` | `weak_ptr<ConnCtx>` | 挂起期间、异步执行期间连接可能已被回收 |
+| `mPendingResumes`（待恢复队列） | `weak_ptr<ConnCtx>` | 跨线程传递，条目可能已失效 |
+| io_uring `user_data` | 裸指针（交给内核，只能存 64 位整数） | 回到 `handleCqe` 后回表取 `shared_ptr` 保活 + 用指针值校验身份 |
+
+原则：**所有跨边界的引用都是弱的；回表时既取强引用保活，又用指针值验身份。**
+
+### 空闲超时
+
+```
+TimeWheelTop（独立线程，1ms 推进 ms 轮）
+   └─ 每秒 add_task 一次 → 置标志 + write(eventfd) → 自我重注册
+        └─ 事件循环 EVENT 分支 → scanIdle()
+             └─ 遍历连接表，回收处于等待状态超过 5s 的连接
 ```
 
-- `feed()` 追加网络数据，`try_parse()` 在报文完整时返回 `HttpRequest`
-- 支持 `Content-Length` 与 `Chunked Transfer-Encoding`
-- URI Query 自动 URL decode，Header key 统一小写存储
+扫描放在**事件循环线程**（它要遍历连接表、还要提交 io_uring 操作），时间轮线程只置标志并唤醒。
 
-### HttpResponse
-
-流式 HTTP 响应构造器。
-
-```cpp
-HttpResponse res;
-res.set_status(200)
-   .set_header("X-Custom", "value")
-   .set_json(R"({"status":"ok"})");
-std::string msg = res.build();   // 生成完整 HTTP 报文
-```
-
-### coro::Task&lt;T&gt;
-
-轻量级协程封装（`include/Server/CoroTask.h`），提供 `T` 的泛化版本与 `void` 特化版本。
-
-- `co_yield` 自定义 Awaiter 挂起 IO 操作
-- `co_await` 组合异步逻辑（如 `QueryAwaiter` 异步投递线程池）
-- `resume()` / `done()` / `get()` 控制协程生命周期
-- `Task<void>::raw_handle()` 获取原始 `std::coroutine_handle<>`，用于外部存储与恢复
-
-### QueryAwaiter
-
-将同步 HTTP Handler 异步化的核心组件。
-
-```cpp
-co_await QueryAwaiter{server, connState, [&]() {
-    handler(req, res);  // 在全局线程池后台执行
-}};
-```
-
-- 利用 `compare_exchange_strong` 设置 `resumePending` 标志，防止同一协程被重复入队
-- 业务任务直投全局线程池（8 工作线程）异步执行，经 eventfd 唤醒恢复协程，无固定调度延迟
-
-### ThreadPool
-
-线程数可配置的共享队列线程池（N 个工作线程共享一个任务队列），框架内置两个独立实例：
-
-- `ThreadPool::global_instance()`：**全局任务池**，8 个工作线程，承载业务 handler 等通用任务
-- `ThreadPool::timewheel_instance()`：**时间轮专用池**，2 个工作线程，只执行时间轮到期的轻量任务
-
-调度模型：
-
-- **共享任务队列**：所有 worker 从同一队列取任务，谁空闲谁取，任务不绑定线程——任何线程被慢任务拖住时，排队任务由其他空闲 worker 继续完成，不会饿死或空转
-- **enqueue 无锁**（MPSC 多生产者安全），**dequeue 消费者互斥**（保证节点回收安全，任务在锁外执行）
-- **广播唤醒**：`submit` 入队后唤醒所有空闲 worker 的等待信号，空闲线程全部醒来竞争取任务
-
-### TimeWheelTop
-
-四级级联时间轮。
-
-```cpp
-TimeWheelTop tw;
-tw.add_task([]{ /* 延迟任务 */ }, {0, 0, 0, 3});  // 延迟 3ms
-```
-
-- 内部线程以 io_uring 1ms 超时驱动推进
-- 支持追赶机制：若线程滞后，会连续推进直到追上理论时刻
-- 到期任务自动投递到时间轮专用线程池执行
-- 延迟小于 3ms 的任务直接投递时间轮专用线程池，避免时间轮精度抖动
-
-### WaitQueue
-
-无锁队列家族，底层通过 io_uring NOP CQE 实现线程间阻塞与唤醒。
-
-| 类 | 模型 | 容量 | 用途 |
-|----|------|------|------|
-| `MPSCQueue<T>` | 多生产者-单消费者 | 动态链表 | 线程池 per-worker 唤醒信号、协程恢复队列 |
-| `MPSCBase<T>` | 多生产者-多消费者（dequeue 加锁） | 动态链表 | 线程池共享任务队列 |
-
-### Logger
-
-基于 `spdlog` 的异步日志单例。
-
-```cpp
-Logger::init("Server", "../logs/app.log", maxSize, maxFiles, Logger::Level::Info);
-LOGGER_INF("Server started on {}:{}", host, port);
-```
-
-- 异步非阻塞，独立线程池刷盘
-- 控制台彩色输出 + 文件按大小轮转切割
+关闭前先 `shutdown(fd, SHUT_RDWR)`：此刻连接上挂着一条未完成的 `recv`，它持有 socket 引用，只提交 `close` 会让 fd 被摘掉而 socket 不真正闭合——FIN 发不出去，客户端等不到断开，那条 `recv` 也等不到数据。
 
 ---
 
-## 编译构建
+## 性能实测
 
-```bash
-# 安装依赖（以 Debian/Ubuntu 为例）
-sudo apt install liburing-dev libspdlog-dev nlohmann-json3-dev
+> 环境：12 核 / 15 GiB / 内核 6.17 / GCC C++23 Release；wrk 4.1.0。
+> 绝对值受机器负载影响（同机运行 IDE 等进程时整机约慢 10%），请以量级与相对关系为准。
 
-# 构建
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+### 端点 × 并发矩阵（Keep-Alive，10s/级，3 轮取中位数）
+
+| 端点 | Low 2/10 | Medium 4/50 | High 4/100 | VeryHigh 8/200 | Extreme 8/500 |
+|------|----------|-------------|------------|----------------|---------------|
+| `GET /json` | 72.6k | 86.3k | 81.1k | 85.0k | **97.3k** |
+| `GET /api/user/42` | 66.6k | 83.4k | 82.2k | 86.1k | **96.2k** |
+| `POST /echo` | 66.0k | 75.2k | 78.5k | 80.4k | **90.3k** |
+| `GET /async/status` | 5.8k | 6.2k | 6.1k | 6.2k | 6.2k |
+
+（单位 req/s；20 个组合的 `connect/read/write/timeout` 与 `Non-2xx` 全部为 0。）
+
+延迟：同步端点 P50 亚毫秒~5ms、P99 < 9ms；服务器 CPU 稳定在 1.10~1.27 核。
+
+### 异步路径的天花板
+
+`/async/status` 的 handler 内含 `sleep(1ms)`：
+
+```
+8 个 worker × (1ms sleep + 289us 链路开销)  ⇒  上限 ≈ 6,200 req/s
+实测跨 10 → 500 连接恒定在 5.8k~6.2k（±3%）
 ```
 
-CMake 选项：
+吞吐对连接数完全不敏感是"固定服务率 + 无限排队"的特征：连接数只改变队列长度，不改变吞吐；延迟随并发线性增长（1.72ms → 7.74 → 16.40 → 32.18 → 78.93ms）。
 
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
-| `CMAKE_BUILD_TYPE` | `Release` | `Release` / `Debug` |
+### 测量可信度
 
----
-
-## API 参考
-
-### HttpRequest
-
-| 成员 / 方法 | 说明 |
-|-------------|------|
-| `method`, `uri`, `version` | 请求行字段 |
-| `headers` | Header 字典（key 已转小写） |
-| `body` | 请求体内容 |
-| `parsed_uri()` | 返回 `ParsedUri`，含 `path` 与 `query`（懒解析，结果缓存） |
-| `get_header_value(name)` | 大小写不敏感查找 Header |
-| `get_param_value(key)` | 获取 URL Query 参数（已 URL decode） |
-
-### HttpResponse
-
-| 方法 | 说明 |
-|------|------|
-| `set_status(code)` / `set_status(code, reason)` | 设置状态码 |
-| `set_header(name, value)` | 设置响应头 |
-| `set_body(body, content_type)` | 设置响应体（自动补全 Content-Length） |
-| `set_json(json_body)` | 快捷设置 JSON 响应（Content-Type: application/json） |
-| `build()` | 序列化为完整 HTTP/1.1 响应字符串 |
+把连接数 `L`、吞吐 `λ`、实测平均延迟 `W` 代进排队论关系 `L = λW`，20 个组合中除最小档（10 连接，统计意义弱）外全部吻合，误差 0.3%~5.3%——说明没有请求被静默丢弃、没有超时截断统计、连接数守恒。
 
 ---
 
-## 设计亮点
-
-1. **协程 + io_uring 零拷贝思维**
-
-   每个连接是独立协程，IO 操作通过 `co_yield IouringAwaiter` 挂起，CQE 到达后恢复。无需为每个连接维护复杂的状态机，代码接近同步风格。
-
-2. **同步快速路径 + QueryAwaiter 显式异步**
-
-   快 handler（字符串拼接、本地查询等）默认在事件循环线程同步执行，无调度开销；慢 handler 通过 `GetAsync/PostAsync` 显式注册，由 `QueryAwaiter` 投递到全局线程池，协程 `co_await` 等待完成后自动恢复，避免阻塞 CQE 消费。
-
-3. **eventfd 跨线程协程去重恢复**
-
-   当后台线程完成任务后，通过 `eventfd` 写入 + `io_uring_poll_add` 监听，将恢复事件带回 io_uring 主循环。`resumePending` 原子标志 + `compare_exchange_strong` 保证同一协程不会被重复入队，彻底消除竞态。
-
-4. **批量 CQE 消费**
-
-   使用 `io_uring_for_each_cqe` 遍历整个完成队列，`io_uring_cq_advance` 一次性标记已消费，相比逐个 `cqe_seen` 显著减少内核态切换与内存屏障开销。
-
-5. **1ms 超时驱动时间轮**
-
-   事件循环在 CQE 为空时以 1ms 超时阻塞等待，既保证空载时 CPU 占用趋近于零，又精确驱动时间轮推进，无需独立定时线程。
-
-6. **共享队列与阶梯式等待**
-
-   工作线程从共享任务队列取任务，空队列时通过独立 io_uring 实例做 `peek -> wait` 的阶梯式阻塞，兼顾低延迟与零空闲 CPU 占用。
-
-7. **广播唤醒**
-
-   `submit` 入队后广播唤醒所有空闲 worker 的等待信号，空闲线程全部醒来竞争取任务；任何线程被慢任务拖住时，其余 worker 继续消化共享队列，不会空转。
-
-8. **时间轮级联与短延迟兜底**
-
-   当延迟小于 3ms 时，任务直接投递线程池执行，避免进入时间轮产生精度抖动；级联设计保证从毫秒到小时的延迟都能以 O(1) 插入。
-
----
-
-## 目录结构
+## 项目结构
 
 ```
 include/
 ├── Server/
 │   ├── Server.h          # io_uring HTTP 服务器主类
-│   ├── Router.h          # 路由表（GET/POST 注册与匹配）
-│   ├── HttpServer.h      # 业务层 Dashboard HTTP 服务器
+│   ├── Router.h          # 路由表（精确 + 目录前缀匹配）
+│   ├── HttpServer.h      # 业务层入口
 │   └── CoroTask.h        # C++23 协程 Task<T>
 ├── Http/
-│   ├── HttpParser.h      # HTTP/1.1 请求解析器
-│   └── HttpResponse.h    # HTTP 响应构造器
+│   ├── HttpParser.h      # HTTP/1.1 请求解析
+│   └── HttpResponse.h    # HTTP 响应构造
 ├── WaitQueue/
-│   ├── SPSCBase.h / SPSCQueue.h   # 无锁 SPSC 队列 + uring 唤醒
-│   └── MPSCBase.h / MPSCQueue.h   # 无锁 MPSC 队列 + uring 唤醒
-├── ThreadPool.h          # 共享队列线程池
-├── TimeWheel.h           # 四级时间轮
-├── Logger.h              # spdlog 异步日志封装
-└── DataBaseQuery/        # 数据层（连接池、查询封装、缓存管理）
+│   ├── SPSCBase.h / SPSCQueue.h   # 无锁 SPSC 环形队列 + uring 唤醒
+│   ├── MPSCBase.h / MPSCQueue.h   # 无锁 MPSC 链表队列 + uring 唤醒
+│   └── MPMCBase.h / MPMCQueue.h   # 无锁 MPMC 环形队列 + 内建 uring 阻塞等待
+├── ThreadPool.h          # 共享任务队列线程池（global 8 / timewheel 2）
+├── TimeWheel.h           # 四级级联时间轮
+└── Logger.h              # spdlog 异步日志封装
+
 src/
-├── Http/
-│   ├── HttpParser.cpp    # 解析器实现
-│   └── HttpResponse.cpp  # 响应构造实现
-├── HttpServer/
-│   ├── Server.cpp        # Server 实现（含 ConnCtx / awaiter 实现）
-│   ├── Router.cpp        # 路由匹配实现
-│   └── Httpserver.cpp    # HttpServer 业务层实现
-├── ThreadPool/
-│   └── ThreadPool.cpp
-├── TimeWheel/
-│   └── TimeWheel.cpp
-├── Logger/
-│   └── Logger.cpp
-├── DataBaseQuery/        # MySQL/Redis 连接池与查询实现
+├── Http/                 # 解析器与响应构造
+├── HttpServer/           # Server.cpp（事件循环/协程/awaiter）、Router.cpp、Httpserver.cpp
+├── ThreadPool/           # 线程池实现
+├── TimeWheel/            # 时间轮实现
+├── Logger/               # 日志实现
 └── main.cpp              # 入口：构造 HttpServer
-tests/
-├── test_connection_pool.cpp
-└── test_pool_simple.cpp
+
+tests/scripts/            # benchmark.sh / test_stress.sh / test_low_pressure.sh / test_api.sh
 ```
 
 ---
 
+## 已知限制
+
+1. **主循环 eventfd 空转**：`submitEventFdRead()` 用 `poll_add` 检测唤醒，但 eventfd 的计数从不被 `read` 消费，第一次写之后即永久可读，事件循环持续空转约 1 核。
+2. **`listen(fd, 10)` backlog 偏小**：突发连接下 accept 会积压。
+3. **路由前缀匹配是线性扫描**：当前路由表小（6 条）无影响，路由数量上升后需要换成前缀树。
+
+---
+
+## 配套文档
+
+- `docs/benchmark-2026-09-18-matrix.md` —— 端点 × 并发矩阵、低压梯度与稳定性完整数据
+- `docs/benchmark-2026-08-19-arch-update.md` 等 —— 各阶段性能记录
+
 ## 许可
 
-本项目为学习/实验性质的高性能服务器框架，可自由修改与扩展。
+学习/实验性质的高性能服务器框架，可自由修改与扩展。

@@ -13,7 +13,6 @@ private:
 
     static Logger m_instance;
     std::shared_ptr<spdlog::logger>        m_logger;
-    std::shared_ptr<spdlog::sinks::sink>   m_console_sink;
     std::shared_ptr<spdlog::sinks::sink>   m_file_sink;
 public:
     enum class Level {
@@ -32,7 +31,7 @@ public:
 public:
     static void init(const std::string& loggerName = "Test",
                      const std::string& filePath = "../logs/test.log",
-                     size_t maxFileSize = (1 << 11) * 10,size_t maxFiles = 5,
+                     size_t maxFileSize = (1 << 20) * 10,size_t maxFiles = 5,
                      Level level = Level::Debug);
 
     template<typename... Args>

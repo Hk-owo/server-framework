@@ -8,7 +8,6 @@
 #include "Logger.h"
 #include "filesystem"
 #include "spdlog/sinks/rotating_file_sink.h"
-#include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/async.h"
 
 using namespace std;
@@ -26,12 +25,8 @@ void Logger::init(const std::string &loggerName, const std::string &filePath, si
 
     std::vector<spdlog::sink_ptr> sinks;
 
-    auto console_sink = std::make_shared<spdlog::sinks::ansicolor_stdout_sink_mt>();
-    console_sink->set_level(static_cast<spdlog::level::level_enum>(level));
-    console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%n] %v");
-    m_instance.m_console_sink = console_sink;
-    sinks.push_back(console_sink);
-
+    // 只保留滚动文件 sink：不再往 stdout 写，进程 stdout 被重定向到文件时
+    // 也不会出现无限增长的日志；文件按大小滚动，只保留最新的 maxFiles 个
     auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(filePath, maxFileSize, maxFiles);
     file_sink->set_level(static_cast<spdlog::level::level_enum>(level));
     file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%n] [thread %t] %v");
