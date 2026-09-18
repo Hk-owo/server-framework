@@ -12,7 +12,7 @@
 
 - **C++23 协程连接模型** —— 每个连接一个协程，读写通过 `co_await IouringAwaiter{...}` 挂起，`await_suspend` 提交对应 IO，CQE 回到事件循环后恢复。协程帧挂在连接对象里，连接回收即协程结束，不需要状态机或回调金字塔。
 
-- **同步快速路径 + 显式异步** —— `server.Get(...)` 注册的 handler **直接在事件循环线程执行**：没有任务入队、没有线程唤醒、没有跨线程协程恢复。实测单核约 7.6 万 req/s（`/json`，8 线程 500 连接时约 9.1 万）。耗时 handler 用 `GetAsync`/`PostAsync` 注册，`QueryAwaiter` 把任务投进全局线程池，后台线程完成后经 `eventfd` 唤醒事件循环恢复协程；`resumePending` 的 CAS 保证同一协程不会被重复入队。
+- **同步快速路径 + 显式异步** —— `server.Get(...)` 注册的 handler **直接在事件循环线程执行**：没有任务入队、没有线程唤醒、没有跨线程协程恢复。实测单核约 7.6 万 req/s（`/json`，8 线程 500 连接时约 9.1 万）。耗时 handler 用 `GetAsync`/`PostAsync` 注册，`QueryAwaiter` 把任务投进全局线程池，后台线程完成后经 `eventfd` 唤醒事件循环恢复协程。等待唤醒用的是 io_uring 的 **read**（由 read 把 eventfd 计数取走并清零）——若改用 `poll_add` 只监听可读而不消费计数，eventfd 从第一次写入起就永久可读，事件循环会空转一整个核。`resumePending` 的 CAS 保证同一协程不会被重复入队。
 
 - **无锁 MPMC 任务队列** —— 所有 worker 共享一条任务队列、谁空闲谁取，因此任何线程被慢任务拖住都不会让排队任务无人处理。队列用**槽位序号**判定归属：入队者等到 `sequence == pos` 才写入，出队者等到 `sequence == pos + 1` 才取走，取走后把序号推到下一圈。多生产者多消费者都不需要锁，内存一次分配、槽位循环复用——**没有节点回收，也就没有 use-after-free**。
 
@@ -247,9 +247,8 @@ tests/scripts/            # benchmark.sh / test_stress.sh / test_low_pressure.sh
 
 ## 已知限制
 
-1. **主循环 eventfd 空转**：`submitEventFdRead()` 用 `poll_add` 检测唤醒，但 eventfd 的计数从不被 `read` 消费，第一次写之后即永久可读，事件循环持续空转约 1 核。
-2. **`listen(fd, 10)` backlog 偏小**：突发连接下 accept 会积压。
-3. **路由前缀匹配是线性扫描**：当前路由表小（6 条）无影响，路由数量上升后需要换成前缀树。
+1. **`listen(fd, 10)` backlog 偏小**：突发连接下 accept 会积压。
+2. **路由前缀匹配是线性扫描**：当前路由表小（6 条）无影响，路由数量上升后需要换成前缀树。
 
 ---
 
