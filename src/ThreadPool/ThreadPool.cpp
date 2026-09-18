@@ -57,8 +57,6 @@ void ThreadPool::start() {
     isClose.store(false, memory_order_relaxed);
 
     mWorkThread.resize(mWorkerCount);
-    isFinish.resize(mWorkerCount);
-    mSignalQueue.resize(mWorkerCount);   // 每个 worker 一个私有唤醒信号
 
     // 工作线程：从共享任务队列取任务，谁空闲谁取
     for (size_t i = 0; i < mWorkerCount; ++i) {
@@ -68,52 +66,40 @@ void ThreadPool::start() {
             while (true) {
                 std::function<void()> task;
 
-                // 尽量排空共享任务队列；dequeue 互斥保护（节点回收安全），
-                // 任务在锁外执行，避免长时间持锁阻塞其他消费者
-                while (true) {
-                    {
-                        std::lock_guard<std::mutex> lk(mDequeueLock);
-                        if (!mTaskQueue.dequeue(task))
-                            break;   // 队列空，退出排空循环
-                    }
+                // 尽量排空共享任务队列；MPMCBase 的槽位带序号，
+                // 多个消费者并发取任务不会取到同一个槽位，也不需要互斥锁
+                while (mTaskQueue.dequeue(task))
                     task();
-                }
 
-                // 队列已空：若 stop 已置位则退出，否则挂起等待唤醒信号
+                // 队列已空：若 stop 已置位则退出，
+                // 否则挂在队列内建的 io_uring ring 上阻塞等待唤醒
                 if (stop.load(memory_order_acquire))
                     break;
 
-                mSignalQueue[i].wait_for_data_uring();
+                mTaskQueue.wait_for_data_uring();
             }
 
             // 退出前排空残余任务（stop 后 submit 方可能仍塞入了任务）
             {
                 std::function<void()> task;
-                while (true) {
-                    {
-                        std::lock_guard<std::mutex> lk(mDequeueLock);
-                        if (!mTaskQueue.dequeue(task))
-                            break;
-                    }
+                while (mTaskQueue.dequeue(task))
                     task();
-                }
             }
 
-            isFinish[i].value.store(true, memory_order_release);
             LOGGER_TRACE("WorkThread {} is finish", i);
         });
     }
 }
 
-// 等待全部线程退出：持续向每个 worker 的唤醒信号发停止通知直到其标记完成
+// 唤醒所有 worker 并回收线程
 void ThreadPool::joinAll() {
-    for (size_t i = 0; i < mWorkerCount; ++i) {
-        while (!isFinish[i].value.load(memory_order_acquire)) {
-            mSignalQueue[i].notify_stop_uring();
-            std::this_thread::yield(); // 让出 CPU，避免空转
-        }
-        if (mWorkThread[i].joinable())
-            mWorkThread[i].join();
+    // 唤醒事件是被原子认领消费掉的，所以要唤醒几个等待者就提交几次；
+    // 正在跑任务的 worker 会自己在下一轮检查 stop，不需要额外信号
+    for (size_t i = 0; i < mWorkerCount; ++i)
+        mTaskQueue.notify_stop_uring();
+    for (auto& th : mWorkThread) {
+        if (th.joinable())
+            th.join();
     }
 }
 
@@ -127,8 +113,6 @@ void ThreadPool::submit(std::function<void()> f) {
         return;
     }
     mTaskQueue.enqueue(f);
-    // 广播唤醒所有 worker 的等待信号：
-    // 空闲的 worker 全部醒来，从共享队列竞争取任务（谁空闲谁取）
-    for (auto& sig : mSignalQueue)
-        sig.on_data_ready_uring();
+    // 提交一次唤醒：有 worker 挂着就唤醒一个，被唤醒者自己去排空队列
+    mTaskQueue.on_data_ready_uring();
 }

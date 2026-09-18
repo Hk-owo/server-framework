@@ -91,8 +91,8 @@ public:
     TimeWheel(TimeWheel&&)            = default;
     TimeWheel& operator=(TimeWheel&&) = default;
 
-    // 高级轮推进：到期任务级联到 lower 轮
-    void advance(TimeWheel* lower);
+    // 高级轮推进：到期任务级联到 lower 轮（只借用，不持有）
+    void advance(TimeWheel& lower);
     // ms 轮推进：到期任务直接投线程池
     void advance();
     // 线程安全插入

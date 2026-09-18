@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <atomic>
 #include <optional>
+#include <memory>
 #include "Logger.h"
 #include "liburing.h"
 
@@ -22,45 +23,70 @@ using namespace std;
 
 // ── ConnCtx ──────────────────────────────────────────────────
 // 连接上下文：单连接的 IO 状态（读写缓冲、短写续传偏移、协程句柄）
+//
+// 读写缓冲直接放在这里（不再是指向协程栈的裸指针）：
+// 地址属于连接对象自己，io_uring 提交出去的缓冲区不会随协程栈变动而悬垂。
+//
+// 所有权：mConnections 里的 shared_ptr 是唯一强引用，谁都不该再持一份强引用
+// （连接持有自己的协程帧，协程帧再持连接就成了环，永远释放不掉），
+// 所以程序内部一律用 weak_ptr 引用它，用到的当下 lock() 出来。
+// 交给 io_uring 的 user_data 只能存64位整数，那儿保持原来的指针，不动。
 struct Server::ConnCtx {
     OpType  status;
     int     fd;
-    std::string* buffer       = nullptr;
+    std::string readBuffer;                 // 读缓冲
+    std::string writeBuffer;                // 写缓冲（响应内容）
     ssize_t      bytes_read   = 0;
-    size_t       write_offset = 0;       // 短写续传偏移
+    size_t       write_offset = 0;          // 短写续传偏移
 
     std::atomic<bool> resumePending{false};
     std::optional<coro::Task<void>> task;
     std::coroutine_handle<>         handle;
 
-    ConnCtx(OpType status, int fd, std::string* buffer)
-            : status(status), fd(fd), buffer(buffer), task(std::nullopt) {}
+    // 空闲超时用：当前是否正等客户端（在读/在写），以及从什么时候开始等
+    std::atomic<bool>    waiting{false};
+    std::atomic<int64_t> waitingSince{0};
+
+    ConnCtx(OpType status, int fd)
+            : status(status), fd(fd), readBuffer(1 << 16, '\0'), task(std::nullopt) {}
 };
 
+// 连接空闲超时：服务器在等客户端（等读或等写）超过这个时长就把连接回收。
+// 没有这道闸，一个连上却不发数据的客户端会永久占住 fd 和 64KB 读缓冲
+static constexpr int64_t kIdleTimeoutMs = 5000;
+
+static int64_t nowMs() {
+    return chrono::duration_cast<chrono::milliseconds>(
+            chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // ── IouringAwaiter ───────────────────────────────────────────
-// co_await 挂起时向 io_uring 提交对应的 IO 请求，完成事件到达后由事件循环恢复协程
+// co_await 挂起时向 io_uring 提交对应的 IO 请求，完成事件到达后由事件循环恢复协程。
+// 缓冲直接取自连接自己（按 status 选读/写缓冲），不需要外部再传指针进来；
+// 同样只弱引用连接
 struct Server::IouringAwaiter {
-    Server*                  server;
-    std::coroutine_handle<>* handle_ptr;
-    Server::ConnCtx*         connState;
-    std::string*             buffer = nullptr;   // CLOSE 时为 nullptr，显式默认
+    Server*                server;
+    std::weak_ptr<ConnCtx> connWeak;
     bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<> h) {
-        *handle_ptr = h;
+        auto conn = connWeak.lock();
+        if (!conn) return;                     // 连接已回收，没什么可提交的
+        conn->handle = h;
+        // 记下"从此刻起在等客户端"，时间轮的空闲扫描据此判定超时
+        conn->waitingSince.store(nowMs(), std::memory_order_relaxed);
+        conn->waiting.store(true, std::memory_order_release);
         LOGGER_INF("await_suspend: status={} fd={} handle={}",
-                   (int)connState->status, connState->fd, (void*)h.address());
+                   (int)conn->status, conn->fd, (void*)h.address());
 
-        switch (connState->status) {
+        switch (conn->status) {
             case OpType::READ:
-                assert(buffer != nullptr);
-                server->submitRecv(connState->fd, *buffer, *connState);
+                server->submitRecv(conn->fd, conn->readBuffer, *conn);
                 break;
             case OpType::WRITE:
-                assert(buffer != nullptr);
-                server->submitWrite(connState->fd, *buffer, *connState);
+                server->submitWrite(conn->fd, conn->writeBuffer, *conn);
                 break;
             case OpType::CLOSE:
-                server->submitClose(connState->fd, *connState);
+                server->submitClose(conn->fd, *conn);
                 break;
             default:
                 break;
@@ -71,22 +97,26 @@ struct Server::IouringAwaiter {
 
 // ── QueryAwaiter ─────────────────────────────────────────────
 // co_await 时将业务 handler 投递到全局线程池异步执行，
-// 完成后经 eventfd 唤醒事件循环恢复协程；resumePending CAS 防止重复入队
+// 完成后经 eventfd 唤醒事件循环恢复协程；resumePending CAS 防止重复入队。
+// 投出去的任务只弱引用连接：任务在工作线程上跑的时候，连接可能已经被事件循环
+// 回收了，这时必须发现"没人可恢复"，而不是拿着野指针去写 resumePending
 struct Server::QueryAwaiter{
-    Server* server;
-    ConnCtx* connState;
-    std::function<void()> callback;
+    Server*                server;
+    std::weak_ptr<ConnCtx> connWeak;
+    std::function<void()>  callback;
     bool await_ready() const noexcept { return false; }
     void await_resume() const noexcept {}
     void await_suspend(std::coroutine_handle<> h) {
-        auto* ctx = connState; // ConnCtx*
+        std::weak_ptr<ConnCtx> weak = connWeak;
         std::function<void()> task =
-                [h, s = server, cb = std::move(callback), ctx] mutable {
+                [h, s = server, cb = std::move(callback), weak] mutable {
                     try { cb(); } catch (...) {}
+                    auto ctx = weak.lock();
+                    if (!ctx) return;          // 连接已回收，没有协程要恢复
                     bool expected = false;
                     if (ctx->resumePending.compare_exchange_strong(expected, true,
                                                                    std::memory_order_acq_rel)) {
-                        auto item = std::make_pair(h, ctx);
+                        auto item = std::make_pair(h, weak);
                         s->mPendingResumes.enqueue(item);
                         uint64_t v = 1;
                         int ret = write(s->mEventFd, &v, sizeof(v));
@@ -99,20 +129,23 @@ struct Server::QueryAwaiter{
 };
 
 int Server::listen(const std::string &bind, const std::string& port) {
-    struct addrinfo hints, *res;
+    // addrinfo 由 C 接口分配，用 unique_ptr 绑定 freeaddrinfo，避免漏释放
+    struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
+    hints.ai_flags    = AI_PASSIVE;
 
-    if (getaddrinfo(bind.c_str(), port.c_str(), &hints, &res) != 0) {
+    struct addrinfo* raw = nullptr;
+    if (getaddrinfo(bind.c_str(), port.c_str(), &hints, &raw) != 0) {
         LOGGER_ERROR("getaddrinfo failed for {}:{}", bind, port);
         return -1;
     }
-    struct addrinfo *p = res;
-    int fd = -1;
+    std::unique_ptr<struct addrinfo, decltype(&freeaddrinfo)> res(raw, &freeaddrinfo);
+
+    int  fd    = -1;
     bool bound = false;
-    do {
+    for (struct addrinfo* p = res.get(); p != nullptr; p = p->ai_next) {
         fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd == -1) {
             LOGGER_ERROR("socket creation failed, family={}", p->ai_family);
@@ -140,9 +173,8 @@ int Server::listen(const std::string &bind, const std::string& port) {
         bound = true;
         LOGGER_INF("Successfully bound and listening on fd={}", fd);
         break;
+    }
 
-    } while ((p = p->ai_next) != nullptr);
-    freeaddrinfo(res);
     if (!bound) {
         LOGGER_ERROR("Failed to bind any address for {}:{}", bind, port);
         return -1;
@@ -185,10 +217,6 @@ void Server::run(unsigned entries, unsigned flags) {
         }
         io_uring_cq_advance(&ring, processed); // 批量标记消费，替代逐个 cqe_seen
 
-        for (auto fd : mPendingClose)
-            mConnections.erase(fd);   // shared_ptr 引用计数归零，ConnCtx 析构
-        mPendingClose.clear();
-
         if (processed == 0) {
             struct __kernel_timespec ts { .tv_sec = 0, .tv_nsec = 1'000'000 }; // 1ms
             ret = io_uring_wait_cqe_timeout(&ring, &cqe, &ts);
@@ -206,8 +234,10 @@ void Server::handleCqe(ConnCtx* connCtx, int res, unsigned cflags) {
         if (res >= 0) {
             int newFd = res;
             LOGGER_INF("New connection fd={}", newFd);
-            auto ctx = std::make_shared<ConnCtx>(OpType::READ, newFd, nullptr);
-            ctx->task.emplace(clientConnect(newFd, ctx.get()));
+            auto ctx = std::make_shared<ConnCtx>(OpType::READ, newFd);
+            // 协程只持弱引用，避免"连接持有协程帧、协程帧又持有连接"的环
+            std::weak_ptr<ConnCtx> weak = ctx;
+            ctx->task.emplace(clientConnect(weak));
             ctx->handle = ctx->task.value().raw_handle();
             mConnections[newFd] = ctx;
             ctx->task.value().resume();
@@ -222,78 +252,136 @@ void Server::handleCqe(ConnCtx* connCtx, int res, unsigned cflags) {
         return;
     }
 
-    switch (connCtx->status) {
+    // eventfd 唤醒：mEventCtx 由 Server 长期持有，不进连接表
+    if (connCtx->status == OpType::EVENT) {
+        // 队列里存的是对连接的弱引用：拿到实指针才能恢复，拿不到说明连接已回收
+        std::pair<std::coroutine_handle<>, std::weak_ptr<ConnCtx>> item;
+        while (mPendingResumes.dequeue(item)) {
+            auto& [h, weak] = item;
+            auto ctx = weak.lock();
+            if (!ctx) {
+                LOGGER_WARN("Stale resume: connection already recycled");
+                continue;
+            }
+            ctx->resumePending.store(false, std::memory_order_release);
+            if (h && !h.done()) h.resume();
+        }
+        // 时间轮线程请求的空闲扫描：扫描要遍历连接表，只能在事件循环线程做
+        if (mScanRequested.exchange(false, std::memory_order_acq_rel))
+            scanIdle();
+        submitEventFdRead();  // 重新提交，等下一次唤醒
+        return;
+    }
+
+    // 普通连接：先回表取一份 shared_ptr 保活，本函数返回前它不会被析构。
+    // 这里必须用指针值确认身份——fd 会被内核立刻复用，只按 fd 查可能查到
+    // 刚接手同一个 fd 号的新连接（那正是"误删新连接"的根源）
+    std::shared_ptr<ConnCtx> conn;
+    auto it = mConnections.find(connCtx->fd);
+    if (it != mConnections.end() && it->second.get() == connCtx)
+        conn = it->second;
+    if (!conn) {
+        // 连接已回收，或这个 fd 号已经归了新连接：陈旧事件，丢弃
+        LOGGER_WARN("Stale CQE for fd={}, dropped", connCtx->fd);
+        return;
+    }
+
+    // IO 完成事件到了，本连接不再是"空闲等待"状态
+    conn->waiting.store(false, std::memory_order_release);
+
+    switch (conn->status) {
         case OpType::READ: {
-            connCtx->bytes_read = res;
-            if (!connCtx->handle || connCtx->handle.done()) {
-                auto it = mConnections.find(connCtx->fd);
-                if (it != mConnections.end())
-                    submitClose(connCtx->fd, *it->second);
+            conn->bytes_read = res;
+            if (!conn->handle || conn->handle.done()) {
+                submitClose(conn->fd, *conn);
                 break;
             }
-            connCtx->handle.resume();
+            conn->handle.resume();
             break;
         }
         case OpType::WRITE: {
             if (res < 0) {
-                LOGGER_ERROR("Write failed fd={} err={}", connCtx->fd, res);
-                auto it = mConnections.find(connCtx->fd);
-                if (it != mConnections.end())
-                    submitClose(connCtx->fd, *it->second);
+                LOGGER_ERROR("Write failed fd={} err={}", conn->fd, res);
+                submitClose(conn->fd, *conn);
                 break;
             }
-            connCtx->write_offset += static_cast<size_t>(res);
-            if (connCtx->buffer &&
-                connCtx->write_offset < connCtx->buffer->size()) {
+            conn->write_offset += static_cast<size_t>(res);
+            if (conn->write_offset < conn->writeBuffer.size()) {
                 LOGGER_INF("Partial write fd={} {}/{}",
-                           connCtx->fd, connCtx->write_offset, connCtx->buffer->size());
-                submitWrite(connCtx->fd, *connCtx->buffer, *connCtx);
+                           conn->fd, conn->write_offset, conn->writeBuffer.size());
+                submitWrite(conn->fd, conn->writeBuffer, *conn);
                 break;
             }
-            connCtx->write_offset = 0;
-            if (!connCtx->handle || connCtx->handle.done()) {
-                LOGGER_ERROR("Invalid handle in WRITE fd={}", connCtx->fd);
-                submitClose(connCtx->fd, *connCtx);
+            conn->write_offset = 0;
+            if (!conn->handle || conn->handle.done()) {
+                LOGGER_ERROR("Invalid handle in WRITE fd={}", conn->fd);
+                submitClose(conn->fd, *conn);
                 break;
             }
-            connCtx->handle.resume();
+            conn->handle.resume();
             break;
         }
         case OpType::CLOSE: {
-            LOGGER_INF("Connection closed fd={}", connCtx->fd);
-            if (connCtx->handle && !connCtx->handle.done())
-                connCtx->handle.resume();
-            mPendingClose.push_back(connCtx->fd);
-            break;
-        }
-        case OpType::EVENT: {
-            // 用 io_uring 提交的 read 来替代阻塞 ::read
-            std::pair<std::coroutine_handle<>, ConnCtx*> item;
-            while (mPendingResumes.dequeue(item)) {
-                auto& [h, ctx] = item;
-                // 验证连接仍然存活
-                if (mConnections.find(ctx->fd) == mConnections.end()) {
-                    LOGGER_WARN("Stale resume for fd={}, skipping", ctx->fd);
-                    ctx->resumePending.store(false, std::memory_order_release);
-                    continue;
-                }
-                ctx->resumePending.store(false, std::memory_order_release);
-                if (h && !h.done()) h.resume();
-            }
-            submitEventFdRead();  // 重新提交，等下一次唤醒
+            LOGGER_INF("Connection closed fd={}", conn->fd);
+            if (conn->handle && !conn->handle.done())
+                conn->handle.resume();
+            // 连接由本函数持有的 shared_ptr 保活，直接从表里摘掉即可，
+            // 不需要延迟到批末：之后再指向它的陈旧CQE会因回表校验失败被丢弃。
+            // 按迭代器删而不是按 fd 删，避免误删刚复用同一 fd 号的新连接
+            mConnections.erase(it);
             break;
         }
         default:
-            LOGGER_ERROR("Unknown OpType fd={}", connCtx->fd);
+            LOGGER_ERROR("Unknown OpType fd={}", conn->fd);
             break;
     }
 }
 
 Server::Server() : mSockFd(-1) {
-    mConnCtx = std::make_shared<ConnCtx>(OpType::ACCEPT, -1, nullptr);
+    mConnCtx = std::make_shared<ConnCtx>(OpType::ACCEPT, -1);
     mEventFd = eventfd(0,EFD_CLOEXEC);
-    mEventCtx = std::make_shared<ConnCtx>(OpType::EVENT, mEventFd, nullptr);
+    mEventCtx = std::make_shared<ConnCtx>(OpType::EVENT, mEventFd);
     LOGGER_INF("mEventFd={} mEventCtx->fd={}", mEventFd, mEventCtx->fd);
+    scheduleScan();   // 启动周期性的空闲连接扫描
+}
+
+// 向时间轮注册下一次空闲扫描，任务执行时再注册下一次，形成每秒一次的心跳。
+// 时间轮任务跑在它自己的线程上，所以这里只置标志 + 写 eventfd，
+// 真正的连接表遍历交给事件循环线程（见 handleCqe 的 EVENT 分支）
+void Server::scheduleScan() {
+    mTimeWheel.add_task([this] {
+        mScanRequested.store(true, std::memory_order_release);
+        uint64_t v = 1;
+        ssize_t n = write(mEventFd, &v, sizeof(v));
+        (void)n;   // 唤醒失败无所谓：下一轮扫描照旧
+        scheduleScan();
+    }, {0, 0, 1, 0});   // 1 秒后
+}
+
+// 回收空闲超时的连接（只在事件循环线程执行，可安全遍历连接表）
+void Server::scanIdle() {
+    if (mConnections.empty()) return;
+
+    const int64_t now = nowMs();
+    std::vector<std::shared_ptr<ConnCtx>> expired;
+
+    for (auto& [fd, conn] : mConnections) {
+        if (!conn->waiting.load(std::memory_order_acquire)) continue;
+        if (now - conn->waitingSince.load(std::memory_order_relaxed) < kIdleTimeoutMs) continue;
+        // 先清标志，避免下一轮又把它挑出来
+        conn->waiting.store(false, std::memory_order_release);
+        expired.push_back(conn);
+    }
+
+    for (auto& conn : expired) {
+        LOGGER_INF("Connection idle timeout, closing fd={}", conn->fd);
+        // 必须先 shutdown：此刻连接上还挂着未完成的 recv，它持有 socket 引用，
+        // 会让 io_uring 的 close 虽然成功返回、socket 却不真正闭合（FIN 发不出去，
+        // 客户端永远等不到断开，而 recv 也永远等不到数据——死锁）。
+        // shutdown 会立刻发出 FIN 并让那个 recv 以 EOF 返回，之后 close 才能生效
+        ::shutdown(conn->fd, SHUT_RDWR);
+        submitClose(conn->fd, *conn);
+    }
 }
 Server::~Server() {
     io_uring_queue_exit(&ring);
@@ -393,7 +481,7 @@ void Server::submitClose(int fd, ConnCtx& connCtx) {
 }
 
 void Server::submitEventFdRead() {
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     if (!sqe) {
         LOGGER_ERROR("submitEventFdRead: SQ full");
         return;
@@ -403,29 +491,37 @@ void Server::submitEventFdRead() {
     io_uring_submit(&ring);
 }
 
-coro::Task<void> Server::clientConnect(int fd, ConnCtx* connState) {
-    std::string  readBuffer(1 << 16, '\0');
-    std::string  writeBuffer;
+coro::Task<void> Server::clientConnect(std::weak_ptr<ConnCtx> connWeak) {
     HttpParser   httpParser;
     HttpResponse httpResponse;
 
-    connState->buffer = &readBuffer;
+    // 本协程内部用裸指针：连接持有这个协程帧，所以只要本协程在跑，连接就一定活着
+    // （回收连接只发生在协程挂起期间，而事件循环是单线程的，两者不会并行）。
+    // 跨线程、跨生命周期的地方不能这么用，那些地方（线程池任务、待恢复队列）
+    // 都各自用 weak_ptr 做了存活校验
+    ConnCtx* connState = nullptr;
+    {
+        auto sp = connWeak.lock();
+        if (!sp) co_return;              // 连接已回收
+        connState = sp.get();
+    }
+
     bool shouldClose = false;
 
     while (!shouldClose) {
         connState->status     = OpType::READ;
         connState->bytes_read = 0;
         connState->handle     = nullptr;
-        co_await IouringAwaiter{this, &connState->handle, connState, &readBuffer};
+        co_await IouringAwaiter{this, connWeak};
 
         ssize_t n = connState->bytes_read;
         if (n <= 0) {
-            if (n < 0) LOGGER_ERROR("Read error fd={} err={}", fd, n);
-            else       LOGGER_INF("Client closed fd={}", fd);
+            if (n < 0) LOGGER_ERROR("Read error fd={} err={}", connState->fd, n);
+            else       LOGGER_INF("Client closed fd={}", connState->fd);
             break;
         }
 
-        httpParser.feed(readBuffer.data(), n);
+        httpParser.feed(connState->readBuffer.data(), n);
 
         if (auto optReq = httpParser.try_parse()) {
                 HttpRequest& req = *optReq;
@@ -440,7 +536,7 @@ coro::Task<void> Server::clientConnect(int fd, ConnCtx* connState) {
                     if (route.async) {
                         HttpRequest  reqSnap = req;
                         auto resSnap = std::make_shared<HttpResponse>();
-                        co_await QueryAwaiter{this, connState,
+                        co_await QueryAwaiter{this, connWeak,
                                               [handler = route.handler, reqSnap = std::move(reqSnap), resSnap]() mutable {
                                                   handler(reqSnap, *resSnap);
                                               }
@@ -461,13 +557,10 @@ coro::Task<void> Server::clientConnect(int fd, ConnCtx* connState) {
                 bool keepAlive = (connHdr != "close");
                 httpResponse.set_header("Connection", keepAlive ? "keep-alive" : "close");
 
-                connState->status  = OpType::WRITE;
-                writeBuffer        = httpResponse.build();
-                connState->buffer  = &writeBuffer;
-                connState->handle  = nullptr;
-                co_yield IouringAwaiter{this, &connState->handle, connState, &writeBuffer};
-
-                connState->buffer = &readBuffer;
+                connState->status      = OpType::WRITE;
+                connState->writeBuffer = httpResponse.build();
+                connState->handle      = nullptr;
+                co_yield IouringAwaiter{this, connWeak};
 
                 if (!keepAlive) {
                     shouldClose = true;
@@ -477,6 +570,6 @@ coro::Task<void> Server::clientConnect(int fd, ConnCtx* connState) {
 
     connState->status = OpType::CLOSE;
     connState->handle = nullptr;
-    co_await IouringAwaiter{this, &connState->handle, connState};
+    co_await IouringAwaiter{this, connWeak};
     co_return;
 }
