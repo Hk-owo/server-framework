@@ -486,7 +486,11 @@ void Server::submitEventFdRead() {
         LOGGER_ERROR("submitEventFdRead: SQ full");
         return;
     }
-    io_uring_prep_poll_add(sqe, mEventFd, POLLIN);
+    // 用 io_uring 的 read 等待并"取走" eventfd 的计数。
+    // eventfd 一旦被写过，计数就会一直保持非零（除非被 read 清掉），
+    // 所以若只用 poll_add 监听可读、从不去读，poll 会永久就绪，
+    // 事件循环就会空转一整个核；read 读到累计值并清零后，下一次才真正阻塞
+    io_uring_prep_read(sqe, mEventFd, &mEventVal, sizeof(mEventVal), 0);
     io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(mEventCtx.get()));
     io_uring_submit(&ring);
 }
