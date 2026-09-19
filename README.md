@@ -80,8 +80,14 @@ int main() {
 ### 压测
 
 ```bash
-./tests/scripts/benchmark.sh --duration 10s     # 分级压测，自动起停服务器并汇总
+./tests/scripts/benchmark.sh --duration 10s            # 仓库自带：单端点分级压测
+./tests/scripts/benchmark_matrix.sh --rounds 3         # 端点 × 并发矩阵（4 端点 × 5 级）
+./tests/scripts/benchmark_low_pressure.sh              # 低压梯度 + 撤压后空载 CPU
+bash tests/scripts/benchmark_multiloop.sh --loops 8    # 多实例扩展 + 瓶颈诊断
+python3 tests/scripts/benchmark_report.py build/Release/benchmark/matrix   # 汇总为表格
 ```
+
+> 压测结果受机器负载影响很大（同一配置在不同负载下可能差数倍），建议在空闲机器上跑，或只比较同一时刻的相邻测量。
 
 ---
 
