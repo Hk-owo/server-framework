@@ -8,6 +8,7 @@
 #include "Logger.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 using namespace std;
@@ -34,16 +35,43 @@ static std::string getHeader(const HttpRequest& req, const std::string& key) {
 // 构造 / 路由注册
 // ─────────────────────────────────────────────
 
-HttpServer::HttpServer() {
-    LOGGER_INF("HttpServer: constructor start");
-    registerRoutes();
-    LOGGER_INF("HttpServer: starting server on 0.0.0.0:8080");
-    server.listen("0.0.0.0", "8080");
-    LOGGER_INF("HttpServer: running server...");
-    server.run();
+// 实例数：默认取 CPU 核数，可用环境变量 SF_LOOPS 覆盖（便于对比不同实例数）
+static unsigned resolveLoopCount() {
+    unsigned n = std::thread::hardware_concurrency();
+    if (n == 0) n = 1;
+    if (const char* env = std::getenv("SF_LOOPS")) {
+        const int v = std::atoi(env);
+        if (v > 0) n = static_cast<unsigned>(v);
+    }
+    return n;
 }
 
-void HttpServer::registerRoutes() {
+HttpServer::HttpServer() {
+    LOGGER_INF("HttpServer: constructor start");
+
+    const unsigned loops = resolveLoopCount();
+    mServers.reserve(loops);
+    for (unsigned i = 0; i < loops; ++i) {
+        auto srv = std::make_shared<Server>();
+        registerRoutes(*srv);                          // 每实例一份只读路由表
+        // SO_REUSEPORT：多个实例共享同一端口，内核按连接 4 元组哈希分发
+        if (srv->listen("0.0.0.0", "8080") != 0) {
+            LOGGER_ERROR("HttpServer: listen failed on event loop {}", i);
+            exit(1);
+        }
+        mServers.push_back(std::move(srv));
+    }
+
+    mLoops.reserve(loops);
+    for (auto& srv : mServers)
+        mLoops.emplace_back([srv] { srv->run(); });
+
+    LOGGER_INF("HttpServer: {} event loop(s) running on 0.0.0.0:8080", loops);
+    for (auto& t : mLoops)
+        t.join();            // 阻塞（与原设计一致：构造函数不返回）
+}
+
+void HttpServer::registerRoutes(Server& server) {
     // GET /hello?name=xxx
     server.Get("/hello", [](const HttpRequest& req, HttpResponse& res) {
         auto name = getParam(req, "name");

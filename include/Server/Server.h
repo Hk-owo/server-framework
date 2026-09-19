@@ -49,7 +49,11 @@ private:
 
 public:
     int listen(const std::string& bind,const std::string& port);
-    void run(unsigned entries = 4096, unsigned flags = 0);
+    // 默认开启 DEFER_TASKRUN | SINGLE_ISSUER：事件循环线程是这个 ring 唯一的提交者，
+    // DEFER_TASKRUN 把 task_work 推迟到下一次进入内核，配合 SINGLE_ISSUER
+    // 让内核省掉提交侧的原子操作（两者必须成对使用，否则 init 会失败）
+    void run(unsigned entries = 4096,
+             unsigned flags = IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SINGLE_ISSUER);
     void Get(std::string pattern, Router::Handler handler);
     void Post(std::string pattern, Router::Handler handler);
     // 异步 handler：投递全局线程池执行（慢任务用）；默认 Get/Post 为同步快速路径

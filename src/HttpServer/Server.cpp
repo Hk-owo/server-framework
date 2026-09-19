@@ -75,8 +75,9 @@ struct Server::IouringAwaiter {
         // 记下"从此刻起在等客户端"，时间轮的空闲扫描据此判定超时
         conn->waitingSince.store(nowMs(), std::memory_order_relaxed);
         conn->waiting.store(true, std::memory_order_release);
-        LOGGER_INF("await_suspend: status={} fd={} handle={}",
-                   (int)conn->status, conn->fd, (void*)h.address());
+        // 每个 IO 事件一条，属于追踪级：默认级别下不产生格式化与入队开销
+        LOGGER_TRACE("await_suspend: status={} fd={} handle={}",
+                     (int)conn->status, conn->fd, (void*)h.address());
 
         switch (conn->status) {
             case OpType::READ:
@@ -120,7 +121,7 @@ struct Server::QueryAwaiter{
                         s->mPendingResumes.enqueue(item);
                         uint64_t v = 1;
                         int ret = write(s->mEventFd, &v, sizeof(v));
-                        LOGGER_INF("write eventfd ret={} errno={}", ret, errno);
+                        LOGGER_TRACE("write eventfd ret={} errno={}", ret, errno);
                     }
                 };
         // 业务任务直投全局线程池：不经时间轮、无固定延迟
@@ -158,6 +159,13 @@ int Server::listen(const std::string &bind, const std::string& port) {
             // 通常不致命，继续执行
         }
 
+        // 多个事件循环实例各绑同一端口，由内核按连接 4 元组哈希分发到其中一个。
+        // 同一 TCP 连接的 4 元组终生不变，所以它的请求恒定落到同一实例，
+        // 连接状态（协程 / 缓冲 / 连接表）天然不需要跨实例同步
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) == -1) {
+            LOGGER_WARN("setsockopt SO_REUSEPORT failed on fd={}, 多实例将无法共享端口", fd);
+        }
+
         if (::bind(fd, p->ai_addr, p->ai_addrlen) == -1) {
             LOGGER_ERROR("bind failed on fd={}, addr family={}", fd, p->ai_family);
             close(fd);
@@ -187,6 +195,13 @@ int Server::listen(const std::string &bind, const std::string& port) {
 
 void Server::run(unsigned entries, unsigned flags) {
     int ret = io_uring_queue_init(entries, &ring, flags);
+    if (ret < 0 && flags != 0) {
+        // 内核不支持这些 flag（DEFER_TASKRUN 需要 6.1+）时退回默认模式，
+        // 不因为一个优化开关而起不来
+        LOGGER_WARN("io_uring_queue_init(flags={}) failed: {}, retrying with defaults",
+                    flags, ret);
+        ret = io_uring_queue_init(entries, &ring, 0);
+    }
     if (ret < 0) {
         LOGGER_ERROR("io_uring_queue_init failed: {}", ret);
         exit(1);
