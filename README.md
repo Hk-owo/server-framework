@@ -2,17 +2,17 @@
 
 **基于 Linux io_uring 与 C++23 协程的 HTTP 服务器框架 —— 单线程事件循环 + 无锁 MPMC 任务队列。**
 
-每个 TCP 连接对应一个独立协程：`co_await` 时向 io_uring 提交 IO 并挂起，CQE 到达后由事件循环恢复，代码写法接近同步、没有状态机。Accept / Recv / Send / Close / Poll 全链路作为 SQE 提交，连接建立用 multishot accept 一次提交持续接收，完成事件按批消费。业务 handler 默认在事件循环线程**同步执行**（零调度开销），耗时任务通过 `GetAsync`/`PostAsync` 显式投递到线程池；线程池的任务队列是一条**槽位序号环形 MPMC 队列**，worker 空闲时直接挂在队列自带的 io_uring ring 上阻塞，空载时全部停在 `io_cqring_wait`，不消耗空转 CPU。
+每个 TCP 连接对应一个独立协程：`co_await` 时向 io_uring 提交 IO 并挂起，CQE 到达后由事件循环恢复，代码写法接近同步、没有状态机。Accept / Recv / Send / Close 以及 eventfd 唤醒全部作为 SQE 提交，连接建立用 multishot accept 一次提交持续接收，完成事件按批消费。业务 handler 默认在事件循环线程**同步执行**（零调度开销），耗时任务通过 `GetAsync`/`PostAsync` 显式投递到线程池；线程池的任务队列是一条**槽位序号环形 MPMC 队列**，worker 空闲时直接挂在队列自带的 io_uring ring 上阻塞，空载时全部停在 `io_cqring_wait`，不消耗空转 CPU。
 
 ---
 
 ## 亮点
 
-- **全链路 io_uring** —— accept / recv / send / close / poll 全部作为 SQE 提交，不为 IO 建立任何线程；multishot accept 一次提交即可持续接收新连接；事件循环用 `io_uring_for_each_cqe` 批量遍历完成队列、`io_uring_cq_advance` 一次性标记消费；**提交侧同样攒批**——`submitXxx` 只把 SQE 放进提交队列、不各自 `io_uring_submit`，由事件循环在每轮末尾用 `io_uring_submit_and_wait_timeout` 把"交出本轮 SQE"与"等待下一个完成事件"合并成**一次 `io_uring_enter`**。
+- **全链路 io_uring** —— accept / recv / send / close / eventfd 读取全部作为 SQE 提交，不为 IO 建立任何线程；multishot accept 一次提交即可持续接收新连接；事件循环用 `io_uring_for_each_cqe` 批量遍历完成队列、`io_uring_cq_advance` 一次性标记消费；**提交侧同样攒批**——`submitXxx` 只把 SQE 放进提交队列、不各自 `io_uring_submit`，由事件循环在每轮末尾用 `io_uring_submit_and_wait_timeout` 把"交出本轮 SQE"与"等待下一个完成事件"合并成**一次 `io_uring_enter`**。
 
 - **C++23 协程连接模型** —— 每个连接一个协程，读写通过 `co_await IouringAwaiter{...}` 挂起，`await_suspend` 提交对应 IO，CQE 回到事件循环后恢复。协程帧挂在连接对象里，连接回收即协程结束，不需要状态机或回调金字塔。
 
-- **同步快速路径 + 显式异步** —— `server.Get(...)` 注册的 handler **直接在事件循环线程执行**：没有任务入队、没有线程唤醒、没有跨线程协程恢复。实测 `/json` 4 线程 100 连接约 **12.6 万 req/s**、8 线程 500 连接约 **11.5 万 req/s**。耗时 handler 用 `GetAsync`/`PostAsync` 注册，`QueryAwaiter` 把任务投进全局线程池，后台线程完成后经 `eventfd` 唤醒事件循环恢复协程。等待唤醒用的是 io_uring 的 **read**（由 read 把 eventfd 计数取走并清零）——若改用 `poll_add` 只监听可读而不消费计数，eventfd 从第一次写入起就永久可读，事件循环会空转一整个核。`resumePending` 的 CAS 保证同一协程不会被重复入队。
+- **同步快速路径 + 显式异步** —— `server.Get(...)` 注册的 handler **直接在事件循环线程执行**：没有任务入队、没有线程唤醒、没有跨线程协程恢复。实测 `/json` 4 线程 100 连接约 **18 万 req/s**（12 核单实例；各并发级别的完整数据见「性能实测」）。耗时 handler 用 `GetAsync`/`PostAsync` 注册，`QueryAwaiter` 把任务投进全局线程池，后台线程完成后经 `eventfd` 唤醒事件循环恢复协程。等待唤醒用的是 io_uring 的 **read**（由 read 把 eventfd 计数取走并清零）——若改用 `poll_add` 只监听可读而不消费计数，eventfd 从第一次写入起就永久可读，事件循环会空转一整个核。`resumePending` 的 CAS 保证同一协程不会被重复入队。
 
 - **无锁 MPMC 任务队列** —— 所有 worker 共享一条任务队列、谁空闲谁取，因此任何线程被慢任务拖住都不会让排队任务无人处理。队列用**槽位序号**判定归属：入队者等到 `sequence == pos` 才写入，出队者等到 `sequence == pos + 1` 才取走，取走后把序号推到下一圈。多生产者多消费者都不需要锁，内存一次分配、槽位循环复用——**没有节点回收，也就没有 use-after-free**。
 
@@ -28,7 +28,7 @@
 
 - **io_uring 提交侧优化** —— 两层：① 事件循环是这条 ring 唯一的提交者，因此启用 `DEFER_TASKRUN | SINGLE_ISSUER`，把 task_work 推迟到下一次进入内核、让内核省掉提交侧的原子操作（内核不支持时自动退回默认模式）；② **提交与等待合并** —— 所有 `submitXxx` 只 `io_uring_get_sqe` + prep，不再各自 `io_uring_submit`，事件循环每轮末尾一次 `io_uring_submit_and_wait_timeout` 同时完成"交出本轮 SQE"和"等下一个完成事件"。第 ② 步之前，每完成一个 IO 要进两次内核（提交下一个 IO + 等待），实测单实例 `GET /json` 4t/100c 由 **11.7 万**升到 **17.9 万 req/s**（+52%），`io_uring_enter` 从每请求 2.4 次降到 0.08 次。配合上面的日志分级，单请求 CPU 在 **7.8us** 量级。刻意未启用 `SQPOLL`——它需要 `CAP_SYS_NICE`，且内核 poller 会常驻占用一个核。
 
-- **多事件循环 × `SO_REUSEPORT`** —— 可按核数启动多个 `Server` 实例（环境变量 `SF_LOOPS`，默认取 CPU 核数），每个实例持有**私有的** io_uring ring、连接表与时间轮；实例之间只通过 `SO_REUSEPORT` 共享监听端口，由内核按连接 4 元组哈希分发——**同一 TCP 连接的请求恒定落到同一实例**，所以连接状态不需要任何跨实例同步。异步 handler 仍然投进共享线程池，完成后再写回**本实例的 eventfd**，因此协程恢复不会串到别的 ring 上。实测 8 实例把 `/json` 从 136k 推到 **449k req/s**（此时瓶颈转移到 loopback 网络栈与压测端）。
+- **多事件循环 × `SO_REUSEPORT`** —— 可按核数启动多个 `Server` 实例（环境变量 `SF_LOOPS`，默认取 CPU 核数），每个实例持有**私有的** io_uring ring、连接表与时间轮；实例之间只通过 `SO_REUSEPORT` 共享监听端口，由内核按连接 4 元组哈希分发——**同一 TCP 连接的请求恒定落到同一实例**，所以连接状态不需要任何跨实例同步。异步 handler 仍然投进共享线程池，完成后再写回**本实例的 eventfd**，因此协程恢复不会串到别的 ring 上。实测 8 实例把 `/json` 推到 **449k req/s**（此时瓶颈转移到 loopback 网络栈与压测端；该组多实例数据测于提交侧合并之前，见「性能实测」的注记）。
 
 ---
 
@@ -127,7 +127,7 @@ accept (multishot CQE)
               │        异步 handler → co_await QueryAwaiter
               │                        └─ 投线程池 → handler 执行
               │                          → CAS resumePending → 入队 + write(eventfd)
-              │                          → 事件循环 poll 到 → 恢复协程
+              │                          → 事件循环 read 到 → 恢复协程
               └─ co_yield IouringAwaiter{WRITE}   ← 提交 send（短写续传）
        └─ co_await IouringAwaiter{CLOSE}          ← 提交 close
 ```
@@ -195,9 +195,11 @@ TimeWheelTop（独立线程，1ms 推进 ms 轮）
 > 环境：12 核 / 15 GiB / 内核 6.17 / GCC C++23 Release；wrk 4.1.0。
 > 绝对值受机器负载影响（同机运行 IDE 等进程时整机约慢 10%），请以量级与相对关系为准。
 
-> **注**：下面的矩阵是本轮"提交与等待合并"改动**之前**测得的。改动后单实例 `GET /json`
-> 在 4t/100c 下由 117k 提升到 **179k req/s**（同一环境、同参数，3 轮方差 < 3%），
-> `io_uring_enter` 由每请求 2.4 次降到 0.08 次；完整矩阵待重测。
+> **注**：本章两个表格（端点 × 并发矩阵、多事件循环扩展性）都是本轮"提交与等待合并"
+> 改动**之前**测得的。改动后单实例 `GET /json` 在 4t/100c 下由 117k 提升到 **179k req/s**
+> （同一环境、同参数，3 轮方差 < 3%），`io_uring_enter` 由每请求 2.4 次降到 0.08 次。
+> 两个表格的完整重测待机器空闲时进行——性能数字对同机负载很敏感，不宜在别的进程
+> 抢 CPU 时补测。
 
 ### 端点 × 并发矩阵（Keep-Alive，10s/级，3 轮取中位数）
 
@@ -238,7 +240,7 @@ TimeWheelTop（独立线程，1ms 推进 ms 轮）
 | 4 | 10 | 390,909 | 388,866 | 2.9× |
 | 8 | 18 | 349,348 | **436,629** | **3.2×** |
 
-扩展是次线性的：8 实例时服务端只用约 2.7 核、压测端约 2.3 核，两者都没打满 12 核——说明瓶颈已经转移到 **loopback 网络栈与压测工具**（要测服务端上限需要多机压测）。单实例 136k → 8 实例 449k，约 3.3 倍。
+扩展是次线性的：8 实例时服务端只用约 2.7 核、压测端约 2.3 核，两者都没打满 12 核——说明瓶颈已经转移到 **loopback 网络栈与压测工具**（要测服务端上限需要多机压测）。上表测得时单实例基线 136k、8 实例 449k，约 3.3 倍；单实例基线现已提升到 179k（见本章开头注记），扩展倍数待重测。
 
 ## 项目结构
 
