@@ -27,13 +27,17 @@ using namespace std;
 // 读写缓冲直接放在这里（不再是指向协程栈的裸指针）：
 // 地址属于连接对象自己，io_uring 提交出去的缓冲区不会随协程栈变动而悬垂。
 //
-// 所有权：mConnections 里的 shared_ptr 是唯一强引用，谁都不该再持一份强引用
-// （连接持有自己的协程帧，协程帧再持连接就成了环，永远释放不掉），
+// 所有权：连接表（mConnections）里的 shared_ptr 是唯一强引用，谁都不该再持一份
+// 强引用（连接持有自己的协程帧，协程帧再持连接就成了环，永远释放不掉），
 // 所以程序内部一律用 weak_ptr 引用它，用到的当下 lock() 出来。
-// 交给 io_uring 的 user_data 只能存64位整数，那儿保持原来的指针，不动。
+//
+// id 是连接在表里的身份证：它单调递增、永不复用，被编进 io_uring 的 user_data。
+// 事件循环拿它查表，查不到就直接丢弃这条 CQE——这一步不读连接对象的任何字段，
+// 所以"对象已经析构、CQE 还在路上"不再构成 use-after-free。
 struct Server::ConnCtx {
-    OpType  status;
-    int     fd;
+    OpType   status;                        // 协程侧下一步想做什么（提交 IO 时看它）
+    uint64_t id;                            // 全局唯一、单调递增，永不复用
+    int      fd;
     std::string readBuffer;                 // 读缓冲
     std::string writeBuffer;                // 写缓冲（响应内容）
     ssize_t      bytes_read   = 0;
@@ -48,7 +52,7 @@ struct Server::ConnCtx {
     std::atomic<int64_t> waitingSince{0};
 
     ConnCtx(OpType status, int fd)
-            : status(status), fd(fd), readBuffer(1 << 16, '\0'), task(std::nullopt) {}
+            : status(status), id(0), fd(fd), readBuffer(1 << 16, '\0'), task(std::nullopt) {}
 };
 
 // 连接空闲超时：服务器在等客户端（等读或等写）超过这个时长就把连接回收。
@@ -58,6 +62,19 @@ static constexpr int64_t kIdleTimeoutMs = 5000;
 static int64_t nowMs() {
     return chrono::duration_cast<chrono::milliseconds>(
             chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// 从提交队列取一个 SQE。主路径上不在这里提交：事件循环每轮末尾会用
+// io_uring_submit_and_wait_timeout 把本轮攒下的 SQE 一次性交给内核，
+// 于是"提交 IO"和"等待完成"合并成同一次 io_uring_enter。
+// 只有极端情况（单轮塞进上万条 SQE 把提交队列占满）才会就地冲一次腾空间
+static struct io_uring_sqe* acquireSqe(struct io_uring& ring) {
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        io_uring_submit(&ring);
+        sqe = io_uring_get_sqe(&ring);
+    }
+    return sqe;
 }
 
 // ── IouringAwaiter ───────────────────────────────────────────
@@ -188,7 +205,6 @@ int Server::listen(const std::string &bind, const std::string& port) {
         return -1;
     }
     mSockFd = fd;
-    mConnCtx->fd = mSockFd;
     LOGGER_INF("Server listening on {}:{}", bind, port);
     return 0;
 }
@@ -207,6 +223,7 @@ void Server::run(unsigned entries, unsigned flags) {
         exit(1);
     }
 
+    // 这两条 SQE 先留在提交队列里，循环第一次进内核时会一起交出去
     submitMultishotAccept();
     submitEventFdRead();
 
@@ -217,44 +234,48 @@ void Server::run(unsigned entries, unsigned flags) {
         unsigned processed = 0;
 
         io_uring_for_each_cqe(&ring, head, cqe) {
-            ConnCtx* connCtx = reinterpret_cast<ConnCtx*>(
-                    io_uring_cqe_get_data64(cqe));
-            int      res   = cqe->res;
+            uint64_t tag    = io_uring_cqe_get_data64(cqe);
+            int      res    = cqe->res;
             unsigned cflags = cqe->flags;
             processed++;
 
-            if (!connCtx) {
-                LOGGER_ERROR("CQE with null connCtx, skipping");
-                continue;
-            }
-
-            handleCqe(connCtx, res, cflags);   // 把 switch 抽成独立函数，下面说
+            // tag 里装的是 (操作类型, 连接 id)，不是指针；回表校验在 handleCqe 内部完成
+            handleCqe(tag, res, cflags);
         }
         io_uring_cq_advance(&ring, processed); // 批量标记消费，替代逐个 cqe_seen
 
-        if (processed == 0) {
-            struct __kernel_timespec ts { .tv_sec = 0, .tv_nsec = 1'000'000 }; // 1ms
-            ret = io_uring_wait_cqe_timeout(&ring, &cqe, &ts);
-            // ETIME = 超时正常返回，继续循环推进时间轮
-            // EINTR = 信号打断，继续
-            if (ret < 0 && ret != -ETIME && ret != -EINTR) {
-                LOGGER_ERROR("io_uring_wait_cqe_timeout: {}", ret);
-            }
+        // 一次 io_uring_enter 同时干两件事：把本轮产生的 SQE 交给内核 + 等下一个完成事件。
+        // 合并这两步不是可有可无的微优化：如果每个 submitXxx 各自 io_uring_submit，
+        // 那么"提交下一个 IO"和"等待它完成"就是两次进入内核，这里一次搞定。
+        //
+        // 超时给到 1s 也不会漏事件：能唤醒本循环的只有 CQE——multishot accept、
+        // 连接上的 recv/send/close、eventfd。空闲超时扫描跑在时间轮自己的 ring 上，
+        // 它只写 eventfd 叫醒本循环。所以不必每毫秒回来空转一次
+        struct __kernel_timespec ts { .tv_sec = 1, .tv_nsec = 0 };
+        ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 1, &ts, nullptr);
+        // ETIME = 超时正常返回，继续循环
+        // EINTR = 信号打断，继续
+        if (ret < 0 && ret != -ETIME && ret != -EINTR) {
+            LOGGER_ERROR("io_uring_submit_and_wait_timeout: {}", ret);
         }
     }
 }
 
-void Server::handleCqe(ConnCtx* connCtx, int res, unsigned cflags) {
-    if (connCtx->fd == mSockFd) {
+void Server::handleCqe(uint64_t tag, int res, unsigned cflags) {
+    const OpType   op     = tagOp(tag);
+    const uint64_t connId = tagConnId(tag);
+
+    if (op == OpType::ACCEPT) {
         if (res >= 0) {
             int newFd = res;
-            LOGGER_INF("New connection fd={}", newFd);
             auto ctx = std::make_shared<ConnCtx>(OpType::READ, newFd);
             // 协程只持弱引用，避免"连接持有协程帧、协程帧又持有连接"的环
             std::weak_ptr<ConnCtx> weak = ctx;
             ctx->task.emplace(clientConnect(weak));
             ctx->handle = ctx->task.value().raw_handle();
-            mConnections[newFd] = ctx;
+            // 先登记进表拿到连接 id，协程 resume 后提交 IO 才有合法的标签可用
+            const uint64_t newId = registerConn(ctx);
+            LOGGER_INF("New connection fd={} id={}", newFd, newId);
             ctx->task.value().resume();
         } else {
             LOGGER_ERROR("Accept error: {}", res);
@@ -267,8 +288,8 @@ void Server::handleCqe(ConnCtx* connCtx, int res, unsigned cflags) {
         return;
     }
 
-    // eventfd 唤醒：mEventCtx 由 Server 长期持有，不进连接表
-    if (connCtx->status == OpType::EVENT) {
+    // eventfd 唤醒：没有连接身份，靠操作类型就能认出来
+    if (op == OpType::EVENT) {
         // 队列里存的是对连接的弱引用：拿到实指针才能恢复，拿不到说明连接已回收
         std::pair<std::coroutine_handle<>, std::weak_ptr<ConnCtx>> item;
         while (mPendingResumes.dequeue(item)) {
@@ -288,24 +309,38 @@ void Server::handleCqe(ConnCtx* connCtx, int res, unsigned cflags) {
         return;
     }
 
-    // 普通连接：先回表取一份 shared_ptr 保活，本函数返回前它不会被析构。
-    // 这里必须用指针值确认身份——fd 会被内核立刻复用，只按 fd 查可能查到
-    // 刚接手同一个 fd 号的新连接（那正是"误删新连接"的根源）
-    std::shared_ptr<ConnCtx> conn;
-    auto it = mConnections.find(connCtx->fd);
-    if (it != mConnections.end() && it->second.get() == connCtx)
-        conn = it->second;
-    if (!conn) {
-        // 连接已回收，或这个 fd 号已经归了新连接：陈旧事件，丢弃
-        LOGGER_WARN("Stale CQE for fd={}, dropped", connCtx->fd);
+    // IORING_OP_ASYNC_CANCEL 自身的完成事件：res=0 表示确实取消了目标，
+    // -ENOENT 表示目标已经自然完成、没赶上。两种情况都不需要做任何事——
+    // 被取消的那条请求会带着它自己的标签再回一条 CQE，由下面那些分支处理。
+    // 放在查表之前是有意的：这条 CQE 可能排在被取消请求的关闭流程之后才到，
+    // 那时连接已经从表里摘掉了；它本身没有语义，不该被当成"陈旧 CQE"报出来
+    if (op == OpType::CANCEL) {
+        LOGGER_TRACE("cancel done id={} res={}", connId, res);
         return;
     }
 
-    // IO 完成事件到了，本连接不再是"空闲等待"状态
+    // 普通连接：按连接 id 回表。id 单调递增、永不复用，所以查不到就一定是陈旧事件。
+    // 这一步只碰 Server 自己的哈希表，不读连接对象的任何字段——所以哪怕连接早已
+    // 回收、内存都还给了 allocator，也只是"查表不匹配"而已，不会踩进已释放的内存
+    auto it = mConnections.find(connId);
+    if (it == mConnections.end()) {
+        LOGGER_WARN("Stale CQE: conn id={} op={} already recycled, dropped",
+                    connId, static_cast<int>(op));
+        return;
+    }
+    std::shared_ptr<ConnCtx> conn = it->second;   // 本函数返回前它不会被析构
+
+    // IO 完成事件到了，本连接不再是"空闲等待"状态。
+    // CANCEL 自身的完成事件也会走到这里：它顺手清掉 waiting 无害——被取消的
+    // 那条请求紧接着会回一条属于它自己的 CQE，把连接重新推进到正常流程里
     conn->waiting.store(false, std::memory_order_release);
 
-    switch (conn->status) {
+    // 按标签里的操作类型分发。这个类型是**提交时**写进 user_data 的，
+    // 不受 status 被谁改过影响，所以一条在途 recv 的完成事件永远不会
+    // 因为连接已被决定关闭而被误当成 close 完成来处理
+    switch (op) {
         case OpType::READ: {
+            // res < 0：读失败，或被 IORING_OP_ASYNC_CANCEL 取消（-ECANCELED）
             conn->bytes_read = res;
             if (!conn->handle || conn->handle.done()) {
                 submitClose(conn->fd, *conn);
@@ -337,27 +372,52 @@ void Server::handleCqe(ConnCtx* connCtx, int res, unsigned cflags) {
             break;
         }
         case OpType::CLOSE: {
-            LOGGER_INF("Connection closed fd={}", conn->fd);
-            if (conn->handle && !conn->handle.done())
-                conn->handle.resume();
-            // 连接由本函数持有的 shared_ptr 保活，直接从表里摘掉即可，
-            // 不需要延迟到批末：之后再指向它的陈旧CQE会因回表校验失败被丢弃。
-            // 按迭代器删而不是按 fd 删，避免误删刚复用同一 fd 号的新连接
-            mConnections.erase(it);
+            LOGGER_INF("Connection closed fd={} id={} err={}", conn->fd, conn->id, res);
+            if (res < 0) {
+                // close 失败或被取消：fd 还没真正关掉，这里补一刀，别漏 fd
+                LOGGER_WARN("close did not take effect fd={} err={}, falling back to ::close",
+                            conn->fd, res);
+                ::close(conn->fd);
+            }
+            // 刻意不 resume 协程：CLOSE 是这条连接的终点。协程要么自己正挂在这条
+            // close 上等收尾（走到协程尾部时的 co_await），要么是被代发 close 打断
+            // 了在途 IO（READ/WRITE 分支发现对端已断时）。两种情况都该结束，
+            // 而不是被唤醒后拿着一个语义对不上的 res 继续跑、再提交第二次 close
+            // （那条多余的 close 会打在可能已被内核复用给新连接的 fd 号上）。
+            // 协程帧随 ConnCtx 析构时由 task 一并销毁，帧内对象的析构照常发生
+            unregisterConn(connId);
             break;
         }
+        case OpType::CANCEL:
+            // CANCEL 的完成事件在上面就 return 了，这里到不了；
+            // 留这个分支只是让 switch 覆盖完 OpType 的全部取值（否则 -Wswitch 报警）
+            break;
         default:
-            LOGGER_ERROR("Unknown OpType fd={}", conn->fd);
+            LOGGER_ERROR("Unknown OpType fd={} id={}", conn->fd, conn->id);
             break;
     }
 }
 
 Server::Server() : mSockFd(-1) {
-    mConnCtx = std::make_shared<ConnCtx>(OpType::ACCEPT, -1);
     mEventFd = eventfd(0,EFD_CLOEXEC);
-    mEventCtx = std::make_shared<ConnCtx>(OpType::EVENT, mEventFd);
-    LOGGER_INF("mEventFd={} mEventCtx->fd={}", mEventFd, mEventCtx->fd);
+    LOGGER_INF("mEventFd={}", mEventFd);
     scheduleScan();   // 启动周期性的空闲连接扫描
+}
+
+// 登记一条新连接：给它发一个全局唯一、单调递增的 id，然后放进连接表。
+// id 永不复用，所以"上一代连接"的陈旧 CQE 回来后根本查不到条目，
+// 会被当成无关事件丢掉——这就是连接身份的全部依据
+uint64_t Server::registerConn(const std::shared_ptr<ConnCtx>& conn) {
+    const uint64_t id = mNextConnId++;
+    conn->id = id;
+    mConnections.emplace(id, conn);
+    return id;
+}
+
+// 从连接表摘除。连接对象此刻可能还没析构（调用方手上那份 shared_ptr 就是
+// 最后一个强引用），那没关系：它的 id 已经不在表里，新的 CQE 不会再来找它
+void Server::unregisterConn(uint64_t id) {
+    mConnections.erase(id);
 }
 
 // 向时间轮注册下一次空闲扫描，任务执行时再注册下一次，形成每秒一次的心跳。
@@ -380,8 +440,12 @@ void Server::scanIdle() {
     const int64_t now = nowMs();
     std::vector<std::shared_ptr<ConnCtx>> expired;
 
-    for (auto& [fd, conn] : mConnections) {
+    for (auto& [connId, conn] : mConnections) {
+        (void)connId;                  // 连接 id 只做 key，取用时用 conn->id
         if (!conn->waiting.load(std::memory_order_acquire)) continue;
+        // 已经在正常关闭流程里（协程尾部正在等 close 完成）的连接不插手：
+        // 取消掉那条 close 反而会让 fd 关不掉
+        if (conn->status == OpType::CLOSE) continue;
         if (now - conn->waitingSince.load(std::memory_order_relaxed) < kIdleTimeoutMs) continue;
         // 先清标志，避免下一轮又把它挑出来
         conn->waiting.store(false, std::memory_order_release);
@@ -389,14 +453,41 @@ void Server::scanIdle() {
     }
 
     for (auto& conn : expired) {
-        LOGGER_INF("Connection idle timeout, closing fd={}", conn->fd);
-        // 必须先 shutdown：此刻连接上还挂着未完成的 recv，它持有 socket 引用，
-        // 会让 io_uring 的 close 虽然成功返回、socket 却不真正闭合（FIN 发不出去，
-        // 客户端永远等不到断开，而 recv 也永远等不到数据——死锁）。
-        // shutdown 会立刻发出 FIN 并让那个 recv 以 EOF 返回，之后 close 才能生效
-        ::shutdown(conn->fd, SHUT_RDWR);
-        submitClose(conn->fd, *conn);
+        LOGGER_INF("Connection idle timeout, cancelling in-flight IO fd={} id={}",
+                   conn->fd, conn->id);
+        // 用 IORING_OP_ASYNC_CANCEL 精确取消这条连接上那条在途的 recv/send，
+        // 而不是 shutdown(fd) 之后再插一条 close。三个理由：
+        //
+        //  1. 被取消的请求会以 -ECANCELED 正常完成，于是协程照旧从 READ/WRITE
+        //     分支走完它自己的关闭流程（协程尾部提交 close），全程只有一条在途
+        //     请求，也就不会出现"同一 fd 上两条 close"——第二条会打在可能已被
+        //     内核复用给新连接的 fd 号上，把别人的连接关掉；
+        //  2. 取消之后那条 recv 不再持有 socket 引用，随后的 close 才能真正
+        //     关掉 socket 并把 FIN 发出去（否则 fd 被摘掉而 socket 还活着，
+        //     客户端永远等不到断开，这正是 shutdown 版本要绕开的问题）；
+        //  3. 取消本身也是一条 SQE，走同一套提交/完成路径，不需要在事件循环里
+        //     夹一个同步的 shutdown 系统调用。
+        //
+        // 全程不改 status：status 只表达"协程下一步想提交什么 IO"，
+        // 谁是"正在关闭"由 CLOSE 这条 CQE 自己说清楚
+        if (!cancelInFlight(*conn)) {
+            // 提交队列实在挤不出位置：把等待标志放回去，下一轮扫描再试
+            conn->waiting.store(true, std::memory_order_release);
+        }
     }
+}
+
+// 取消某条连接上那条在途请求（按 user_data 精确匹配，即按 (操作类型, 连接 id)）。
+// cancel 自己的完成事件用 (CANCEL, id) 作标签，在 handleCqe 里被直接放过
+bool Server::cancelInFlight(const ConnCtx& connCtx) {
+    struct io_uring_sqe* sqe = acquireSqe(ring);
+    if (!sqe) {
+        LOGGER_ERROR("cancelInFlight: SQ full, fd={} id={}", connCtx.fd, connCtx.id);
+        return false;
+    }
+    io_uring_prep_cancel64(sqe, packTag(connCtx.status, connCtx.id), 0);
+    io_uring_sqe_set_data64(sqe, packTag(OpType::CANCEL, connCtx.id));
+    return true;
 }
 Server::~Server() {
     io_uring_queue_exit(&ring);
@@ -419,51 +510,44 @@ void Server::PostAsync(std::string pattern, Router::Handler handler) {
 }
 
 int Server::submitMultishotAccept() {
-    struct io_uring_sqe *sqe;
-    // 获取 SQE
-    sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe *sqe = acquireSqe(ring);
     if (!sqe) {
-        // 如果 SQ 满了，先提交再重试
-        io_uring_submit(&ring);
-        sqe = io_uring_get_sqe(&ring);
-        if (!sqe) {
-            return -1;
-        }
+        return -1;
     }
     // 准备 multishot accept - 一次提交，持续接受新连接
     // 每次有新连接时自动产生 CQE，并自动重新武装
     io_uring_prep_multishot_accept(sqe, mSockFd, NULL, NULL, 0);
-    // 设置用户数据，用于在 CQE 中识别这是 accept 操作
-    io_uring_sqe_set_data64(sqe, (uint64_t)mConnCtx.get());
-    // 提交到内核
-    return io_uring_submit(&ring);
+    // accept 不属于任何连接，标签里只填操作类型
+    io_uring_sqe_set_data64(sqe, packTag(OpType::ACCEPT, 0));
+    return 0;
 }
 
 int Server::submitAccept() {
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe* sqe = acquireSqe(ring);
     if (!sqe) {
         LOGGER_ERROR("submitAccept: SQ full");
         return -1;
     }
     io_uring_prep_accept(sqe, mSockFd, NULL, NULL, 0);
-    io_uring_sqe_set_data64(sqe, (uint64_t)mConnCtx.get());
-    return io_uring_submit(&ring);
+    io_uring_sqe_set_data64(sqe, packTag(OpType::ACCEPT, 0));
+    return 0;
 }
 
 void Server::submitRecv(int fd, std::string& buffer, ConnCtx& connCtx) {
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe* sqe = acquireSqe(ring);
     if (!sqe) {
         LOGGER_ERROR("submitRecv: SQ full, closing fd={}", fd);
         submitClose(fd, connCtx);
         return;
     }
     io_uring_prep_recv(sqe, fd, buffer.data(), buffer.size(), 0);
-    io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(&connCtx));
-    io_uring_submit(&ring);
+    // 标签带操作类型：这条 recv 的完成事件以后只会走 READ 分支，
+    // 跟这条连接此后是不是被决定关闭没有关系
+    io_uring_sqe_set_data64(sqe, packTag(OpType::READ, connCtx.id));
 }
 
 void Server::submitWrite(int fd, std::string& msg, ConnCtx& connCtx) {
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe* sqe = acquireSqe(ring);
     if (!sqe) {
         LOGGER_ERROR("submitWrite: SQ full, closing fd={}", fd);
         submitClose(fd, connCtx);
@@ -474,29 +558,25 @@ void Server::submitWrite(int fd, std::string& msg, ConnCtx& connCtx) {
     size_t      left = msg.size()  - connCtx.write_offset;
 
     io_uring_prep_send(sqe, fd, ptr, left, 0);
-    io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(&connCtx));
-    io_uring_submit(&ring);
+    io_uring_sqe_set_data64(sqe, packTag(OpType::WRITE, connCtx.id));
 }
 
 void Server::submitClose(int fd, ConnCtx& connCtx) {
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe* sqe = acquireSqe(ring);
     if (!sqe) {
         LOGGER_ERROR("submitClose: SQ full, force close fd={}", fd);
         ::close(fd);
         return;
     }
-    connCtx.status = OpType::CLOSE;
     io_uring_prep_close(sqe, fd);
-    io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(&connCtx));
-    int ret = io_uring_submit(&ring);
-    if (ret < 0) {
-        LOGGER_ERROR("submitClose submit failed: {}", ret);
-        ::close(fd);
-    }
+    // 不在这里改 connCtx.status：status 是"协程下一步想提交什么 IO"，
+    // 被外部改写成 CLOSE 就会让协程恢复后误以为自己该走关闭分支。
+    // "这条连接正在关闭"这件事由这条 close 的完成事件自己负责（带 CLOSE 标签）
+    io_uring_sqe_set_data64(sqe, packTag(OpType::CLOSE, connCtx.id));
 }
 
 void Server::submitEventFdRead() {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe *sqe = acquireSqe(ring);
     if (!sqe) {
         LOGGER_ERROR("submitEventFdRead: SQ full");
         return;
@@ -506,8 +586,7 @@ void Server::submitEventFdRead() {
     // 所以若只用 poll_add 监听可读、从不去读，poll 会永久就绪，
     // 事件循环就会空转一整个核；read 读到累计值并清零后，下一次才真正阻塞
     io_uring_prep_read(sqe, mEventFd, &mEventVal, sizeof(mEventVal), 0);
-    io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(mEventCtx.get()));
-    io_uring_submit(&ring);
+    io_uring_sqe_set_data64(sqe, packTag(OpType::EVENT, 0));
 }
 
 coro::Task<void> Server::clientConnect(std::weak_ptr<ConnCtx> connWeak) {
@@ -535,8 +614,15 @@ coro::Task<void> Server::clientConnect(std::weak_ptr<ConnCtx> connWeak) {
 
         ssize_t n = connState->bytes_read;
         if (n <= 0) {
-            if (n < 0) LOGGER_ERROR("Read error fd={} err={}", connState->fd, n);
-            else       LOGGER_INF("Client closed fd={}", connState->fd);
+            if (n == -ECANCELED) {
+                // 空闲超时扫描用 IORING_OP_ASYNC_CANCEL 取消了这条在途 recv：
+                // 属于正常回收路径，不是读错误
+                LOGGER_INF("Read cancelled by idle scan fd={}", connState->fd);
+            } else if (n < 0) {
+                LOGGER_ERROR("Read error fd={} err={}", connState->fd, n);
+            } else {
+                LOGGER_INF("Client closed fd={}", connState->fd);
+            }
             break;
         }
 

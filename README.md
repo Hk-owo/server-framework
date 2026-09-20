@@ -2,33 +2,33 @@
 
 **基于 Linux io_uring 与 C++23 协程的 HTTP 服务器框架 —— 单线程事件循环 + 无锁 MPMC 任务队列。**
 
-每个 TCP 连接对应一个独立协程：`co_await` 时向 io_uring 提交 IO 并挂起，CQE 到达后由事件循环恢复，代码写法接近同步、没有状态机。Accept / Recv / Send / Close / Poll 全链路作为 SQE 提交，连接建立用 multishot accept 一次提交持续接收，完成事件按批消费。业务 handler 默认在事件循环线程**同步执行**（零调度开销），耗时任务通过 `GetAsync`/`PostAsync` 显式投递到线程池；线程池的任务队列是一条**槽位序号环形 MPMC 队列**，worker 空闲时直接挂在队列自带的 io_uring ring 上阻塞，空载时全部停在 `io_cqring_wait`，不消耗空转 CPU。
+每个 TCP 连接对应一个独立协程：`co_await` 时向 io_uring 提交 IO 并挂起，CQE 到达后由事件循环恢复，代码写法接近同步、没有状态机。Accept / Recv / Send / Close 以及 eventfd 唤醒全部作为 SQE 提交，连接建立用 multishot accept 一次提交持续接收，完成事件按批消费。业务 handler 默认在事件循环线程**同步执行**（零调度开销），耗时任务通过 `GetAsync`/`PostAsync` 显式投递到线程池；线程池的任务队列是一条**槽位序号环形 MPMC 队列**，worker 空闲时直接挂在队列自带的 io_uring ring 上阻塞，空载时全部停在 `io_cqring_wait`，不消耗空转 CPU。
 
 ---
 
 ## 亮点
 
-- **全链路 io_uring** —— accept / recv / send / close / poll 全部作为 SQE 提交，不为 IO 建立任何线程；multishot accept 一次提交即可持续接收新连接；事件循环用 `io_uring_for_each_cqe` 批量遍历完成队列、`io_uring_cq_advance` 一次性标记消费，减少内核态往返。
+- **全链路 io_uring** —— accept / recv / send / close / eventfd 读取全部作为 SQE 提交，不为 IO 建立任何线程；multishot accept 一次提交即可持续接收新连接；事件循环用 `io_uring_for_each_cqe` 批量遍历完成队列、`io_uring_cq_advance` 一次性标记消费；**提交侧同样攒批**——`submitXxx` 只把 SQE 放进提交队列、不各自 `io_uring_submit`，由事件循环在每轮末尾用 `io_uring_submit_and_wait_timeout` 把"交出本轮 SQE"与"等待下一个完成事件"合并成**一次 `io_uring_enter`**。
 
 - **C++23 协程连接模型** —— 每个连接一个协程，读写通过 `co_await IouringAwaiter{...}` 挂起，`await_suspend` 提交对应 IO，CQE 回到事件循环后恢复。协程帧挂在连接对象里，连接回收即协程结束，不需要状态机或回调金字塔。
 
-- **同步快速路径 + 显式异步** —— `server.Get(...)` 注册的 handler **直接在事件循环线程执行**：没有任务入队、没有线程唤醒、没有跨线程协程恢复。实测 `/json` 4 线程 100 连接约 **12.6 万 req/s**、8 线程 500 连接约 **11.5 万 req/s**。耗时 handler 用 `GetAsync`/`PostAsync` 注册，`QueryAwaiter` 把任务投进全局线程池，后台线程完成后经 `eventfd` 唤醒事件循环恢复协程。等待唤醒用的是 io_uring 的 **read**（由 read 把 eventfd 计数取走并清零）——若改用 `poll_add` 只监听可读而不消费计数，eventfd 从第一次写入起就永久可读，事件循环会空转一整个核。`resumePending` 的 CAS 保证同一协程不会被重复入队。
+- **同步快速路径 + 显式异步** —— `server.Get(...)` 注册的 handler **直接在事件循环线程执行**：没有任务入队、没有线程唤醒、没有跨线程协程恢复。实测 `/json` 4 线程 100 连接约 **18 万 req/s**（12 核单实例；各并发级别的完整数据见「性能实测」）。耗时 handler 用 `GetAsync`/`PostAsync` 注册，`QueryAwaiter` 把任务投进全局线程池，后台线程完成后经 `eventfd` 唤醒事件循环恢复协程。等待唤醒用的是 io_uring 的 **read**（由 read 把 eventfd 计数取走并清零）——若改用 `poll_add` 只监听可读而不消费计数，eventfd 从第一次写入起就永久可读，事件循环会空转一整个核。`resumePending` 的 CAS 保证同一协程不会被重复入队。
 
 - **无锁 MPMC 任务队列** —— 所有 worker 共享一条任务队列、谁空闲谁取，因此任何线程被慢任务拖住都不会让排队任务无人处理。队列用**槽位序号**判定归属：入队者等到 `sequence == pos` 才写入，出队者等到 `sequence == pos + 1` 才取走，取走后把序号推到下一圈。多生产者多消费者都不需要锁，内存一次分配、槽位循环复用——**没有节点回收，也就没有 use-after-free**。
 
 - **阻塞等待内建在队列里** —— worker 队列取空后挂在**队列自己的 io_uring ring** 上等待，而不是忙等轮询。多消费者等待需要两道保障：等待者用**计数器**登记（单布尔会被最后一个退出者清掉，导致其余等待者再也等不到唤醒）、CQE 用 **CAS 原子认领**（liburing 的 `io_uring_cqe_seen` 实现是 `*khead = *khead + 1`，并发消费会丢更新并把 CQ 的 head 推错）。
 
-- **连接生命周期用弱引用** —— 连接表独占持有连接对象，**所有跨线程或跨生命周期边界的引用都是 `weak_ptr`**：投进线程池的异步任务、待恢复协程队列都在取用时 `lock()` 确认存活，拿不到就丢弃。协程内部则用裸指针——连接持有协程帧，所以"协程在跑"就蕴含"连接活着"；这个不变式不能改用 `shared_ptr` 表达，否则连接与协程帧会互相持有成环。
+- **连接生命周期用弱引用 + 单调递增连接 id** —— 连接表独占持有连接对象，**所有跨线程或跨生命周期边界的引用都是 `weak_ptr`**：投进线程池的异步任务、待恢复协程队列都在取用时 `lock()` 确认存活，拿不到就丢弃。协程内部则用裸指针——连接持有协程帧，所以"协程在跑"就蕴含"连接活着"；这个不变式不能改用 `shared_ptr` 表达，否则连接与协程帧会互相持有成环。回到事件循环这一路则**既不存指针、也不解引用对象**：`user_data` 里放的是 `(操作类型, 连接 id)` 打包成的 64 位标签，`handleCqe` 先按 id 回表，查不到就是陈旧事件——id 单调递增、永不复用，所以"上一代连接"的 CQE 不可能撞上"新一代连接"，也就不需要额外的一代代次（裸指针会被 allocator 复用，连接 id 不会）。
 
-- **时间轮驱动的空闲超时** —— 四级级联时间轮（`ms → sec → min → hour`，最小刻度 1ms，由独立的 io_uring 1ms 超时驱动并带追赶机制）。当前接入点是**连接空闲超时**：时间轮每秒唤醒一次事件循环，扫描连接表回收"服务器在等客户端却一直等不到"的连接（阈值 5s），避免一个连上却不发数据的客户端永久占住 fd 和 64KB 读缓冲。关闭前先 `shutdown(fd, SHUT_RDWR)`——连接上那条未完成的 `recv` 持有 socket 引用，只提交 `close` 的话 fd 会被摘掉而 socket 并不真正闭合，FIN 发不出去。
+- **时间轮驱动的空闲超时** —— 四级级联时间轮（`ms → sec → min → hour`，最小刻度 1ms，由独立的 io_uring 1ms 超时驱动并带追赶机制）。当前接入点是**连接空闲超时**：时间轮每秒唤醒一次事件循环，扫描连接表回收"服务器在等客户端却一直等不到"的连接（阈值 5s），避免一个连上却不发数据的客户端永久占住 fd 和 64KB 读缓冲。扫描对超时连接发一条 **`IORING_OP_ASYNC_CANCEL`**，按 `(操作类型, 连接 id)` 精确取消它那条在途的 `recv`/`send`——被取消的请求以 `-ECANCELED` 正常完成，协程照旧从 READ/WRITE 分支走完自己的关闭流程（协程尾部提交 `close`）。比 `shutdown + close` 更干净：**全程只有一条在途请求**，同一个 fd 上不会出现两条 close（第二条会打在可能已被内核复用给新连接的 fd 号上）；被取消的请求不再持有 socket 引用，随后的 close 才能真正关掉 socket 并把 FIN 发出去；而且取消本身就是一条 SQE，不必在事件循环里夹一个同步的 `shutdown` 系统调用。
 
 - **HTTP/1.1 完整实现** —— 请求行与 Header 解析、URI Query 自动解码、`Content-Length` 与 `Chunked Transfer-Encoding`、Keep-Alive 长连接；发送侧支持**短写续传**（记录断点，上层业务无感知）。
 
 - **异步滚动日志** —— spdlog 异步 logger，只挂滚动文件 sink（每个 10MB、保留 5 个），不向 stdout 输出，因此即便把进程 stdout 重定向到文件也不会产生无限增长的日志。日志按级别分工：连接建立/关闭、空闲超时、各类错误走 INFO，而**每个 IO 事件**的追踪日志走 TRACE——默认级别下不产生任何格式化与入队开销。
 
-- **io_uring 提交侧优化** —— 事件循环是这条 ring 唯一的提交者，因此启用 `DEFER_TASKRUN | SINGLE_ISSUER`：把 task_work 推迟到下一次进入内核，并让内核省掉提交侧的原子操作（内核不支持时自动退回默认模式）。配合上面的日志分级，单请求 CPU 从 16.8us 降到 **7.8us**。刻意未启用 `SQPOLL`——它需要 `CAP_SYS_NICE`，且内核 poller 会常驻占用一个核。
+- **io_uring 提交侧优化** —— 两层：① 事件循环是这条 ring 唯一的提交者，因此启用 `DEFER_TASKRUN | SINGLE_ISSUER`，把 task_work 推迟到下一次进入内核、让内核省掉提交侧的原子操作（内核不支持时自动退回默认模式）；② **提交与等待合并** —— 所有 `submitXxx` 只 `io_uring_get_sqe` + prep，不再各自 `io_uring_submit`，事件循环每轮末尾一次 `io_uring_submit_and_wait_timeout` 同时完成"交出本轮 SQE"和"等下一个完成事件"。第 ② 步之前，每完成一个 IO 要进两次内核（提交下一个 IO + 等待），实测单实例 `GET /json` 4t/100c 由 **11.7 万**升到 **17.9 万 req/s**（+52%），`io_uring_enter` 从每请求 2.4 次降到 0.08 次。配合上面的日志分级，单请求 CPU 在 **7.8us** 量级。刻意未启用 `SQPOLL`——它需要 `CAP_SYS_NICE`，且内核 poller 会常驻占用一个核。
 
-- **多事件循环 × `SO_REUSEPORT`** —— 可按核数启动多个 `Server` 实例（环境变量 `SF_LOOPS`，默认取 CPU 核数），每个实例持有**私有的** io_uring ring、连接表与时间轮；实例之间只通过 `SO_REUSEPORT` 共享监听端口，由内核按连接 4 元组哈希分发——**同一 TCP 连接的请求恒定落到同一实例**，所以连接状态不需要任何跨实例同步。异步 handler 仍然投进共享线程池，完成后再写回**本实例的 eventfd**，因此协程恢复不会串到别的 ring 上。实测 8 实例把 `/json` 从 136k 推到 **449k req/s**（此时瓶颈转移到 loopback 网络栈与压测端）。
+- **多事件循环 × `SO_REUSEPORT`** —— 可按核数启动多个 `Server` 实例（环境变量 `SF_LOOPS`，默认取 CPU 核数），每个实例持有**私有的** io_uring ring、连接表与时间轮；实例之间只通过 `SO_REUSEPORT` 共享监听端口，由内核按连接 4 元组哈希分发——**同一 TCP 连接的请求恒定落到同一实例**，所以连接状态不需要任何跨实例同步。异步 handler 仍然投进共享线程池，完成后再写回**本实例的 eventfd**，因此协程恢复不会串到别的 ring 上。实测 8 实例把 `/json` 推到 **449k req/s**（此时瓶颈转移到 loopback 网络栈与压测端；该组多实例数据测于提交侧合并之前，见「性能实测」的注记）。
 
 ---
 
@@ -105,7 +105,7 @@ python3 tests/scripts/benchmark_report.py build/Release/benchmark/matrix   # 汇
 │ 服务层  Server            src/HttpServer/Server.cpp                │
 │         单线程 io_uring 事件循环 + 每连接一个协程                   │
 │         ConnCtx / IouringAwaiter / QueryAwaiter                    │
-│         状态：mConnections / mPendingResumes / mTimeWheel / mEventFd│
+│         状态：mConnections(按连接 id) / mPendingResumes / mTimeWheel / mEventFd│
 ├────────────────────────────────────────────────────────────────────┤
 │ 协议层  HttpParser / HttpResponse                                 │
 ├────────────────────────────────────────────────────────────────────┤
@@ -127,7 +127,7 @@ accept (multishot CQE)
               │        异步 handler → co_await QueryAwaiter
               │                        └─ 投线程池 → handler 执行
               │                          → CAS resumePending → 入队 + write(eventfd)
-              │                          → 事件循环 poll 到 → 恢复协程
+              │                          → 事件循环 read 到 → 恢复协程
               └─ co_yield IouringAwaiter{WRITE}   ← 提交 send（短写续传）
        └─ co_await IouringAwaiter{CLOSE}          ← 提交 close
 ```
@@ -162,13 +162,13 @@ accept (multishot CQE)
 
 | 角色 | 持有方式 | 理由 |
 |------|---------|------|
-| `mConnections`（连接表） | `shared_ptr<ConnCtx>` | 唯一强引用 |
+| `mConnections`（连接表） | `shared_ptr<ConnCtx>`，按单调递增的连接 id 索引 | 唯一强引用；id 永不复用，查不到即陈旧事件 |
 | 协程内部 | 裸指针 | 连接持有协程帧 ⇒ 协程在跑则连接必活 |
 | `IouringAwaiter` / `QueryAwaiter` | `weak_ptr<ConnCtx>` | 挂起期间、异步执行期间连接可能已被回收 |
 | `mPendingResumes`（待恢复队列） | `weak_ptr<ConnCtx>` | 跨线程传递，条目可能已失效 |
-| io_uring `user_data` | 裸指针（交给内核，只能存 64 位整数） | 回到 `handleCqe` 后回表取 `shared_ptr` 保活 + 用指针值校验身份 |
+| io_uring `user_data` | `(操作类型, 连接 id)` 打包的 64 位标签 | 只有 64 位可用；带操作类型让 CQE 的处理路径在提交时就定死，不依赖会被多方改写的 `ConnCtx::status` |
 
-原则：**所有跨边界的引用都是弱的；回表时既取强引用保活，又用指针值验身份。**
+原则：**所有跨边界的引用都是弱的；回到事件循环先按标签（id + 操作类型）定位与分流，再取强引用保活。**
 
 ### 空闲超时
 
@@ -176,12 +176,17 @@ accept (multishot CQE)
 TimeWheelTop（独立线程，1ms 推进 ms 轮）
    └─ 每秒 add_task 一次 → 置标志 + write(eventfd) → 自我重注册
         └─ 事件循环 EVENT 分支 → scanIdle()
-             └─ 遍历连接表，回收处于等待状态超过 5s 的连接
+             └─ 遍历连接表，对"等了超过 5s 还没等到客户端"的连接提交一条 IORING_OP_ASYNC_CANCEL
+                  └─ 精确取消该连接上那条在途的 recv/send（按 (操作类型, 连接 id) 匹配）
+                       └─ 被取消的请求以 -ECANCELED 完成 → 协程从 READ/WRITE 分支走完正常关闭流程
+                            └─ 协程尾部提交 close（此时那条 recv 已经不持有 socket 引用）
 ```
 
 扫描放在**事件循环线程**（它要遍历连接表、还要提交 io_uring 操作），时间轮线程只置标志并唤醒。
 
-关闭前先 `shutdown(fd, SHUT_RDWR)`：此刻连接上挂着一条未完成的 `recv`，它持有 socket 引用，只提交 `close` 会让 fd 被摘掉而 socket 不真正闭合——FIN 发不出去，客户端等不到断开，那条 `recv` 也等不到数据。
+超时回收不再用 `shutdown(fd)` 再补一条 `close`，而是发一条 `IORING_OP_ASYNC_CANCEL` 取消在途那一条请求：它随即以 `-ECANCELED` 完成，协程照旧走完自己的关闭流程。这样做有三个好处——其一，全程只有一条在途请求，同一个 fd 上不会出现第二条 `close`（那条会打在可能已被内核复用给新连接的 fd 号上，把别人的连接关掉）；其二，被取消的请求不再持有 socket 引用，随后的 `close` 才能真正关掉 socket 并把 FIN 发出去（否则 fd 被摘掉而 socket 还活着，客户端永远等不到断开）；其三，取消本身也是一条 SQE，不必在事件循环里夹一个同步的 `shutdown` 系统调用。
+
+同时 `ConnCtx::status` 只表达"协程下一步想提交什么 IO"，`submitClose` 不再把它改写成"正在关闭"——一条 CQE 该走哪条处理路径，由它自己标签里的**操作类型**说了算，因此不会出现"`recv` 还在途时又插一条 `close`，于是 `recv` 的完成事件被当成 close 完成来处理"这种状态错配。
 
 ---
 
@@ -189,6 +194,12 @@ TimeWheelTop（独立线程，1ms 推进 ms 轮）
 
 > 环境：12 核 / 15 GiB / 内核 6.17 / GCC C++23 Release；wrk 4.1.0。
 > 绝对值受机器负载影响（同机运行 IDE 等进程时整机约慢 10%），请以量级与相对关系为准。
+
+> **注**：本章两个表格（端点 × 并发矩阵、多事件循环扩展性）都是本轮"提交与等待合并"
+> 改动**之前**测得的。改动后单实例 `GET /json` 在 4t/100c 下由 117k 提升到 **179k req/s**
+> （同一环境、同参数，3 轮方差 < 3%），`io_uring_enter` 由每请求 2.4 次降到 0.08 次。
+> 两个表格的完整重测待机器空闲时进行——性能数字对同机负载很敏感，不宜在别的进程
+> 抢 CPU 时补测。
 
 ### 端点 × 并发矩阵（Keep-Alive，10s/级，3 轮取中位数）
 
@@ -229,7 +240,7 @@ TimeWheelTop（独立线程，1ms 推进 ms 轮）
 | 4 | 10 | 390,909 | 388,866 | 2.9× |
 | 8 | 18 | 349,348 | **436,629** | **3.2×** |
 
-扩展是次线性的：8 实例时服务端只用约 2.7 核、压测端约 2.3 核，两者都没打满 12 核——说明瓶颈已经转移到 **loopback 网络栈与压测工具**（要测服务端上限需要多机压测）。单实例 136k → 8 实例 449k，约 3.3 倍。
+扩展是次线性的：8 实例时服务端只用约 2.7 核、压测端约 2.3 核，两者都没打满 12 核——说明瓶颈已经转移到 **loopback 网络栈与压测工具**（要测服务端上限需要多机压测）。上表测得时单实例基线 136k、8 实例 449k，约 3.3 倍；单实例基线现已提升到 179k（见本章开头注记），扩展倍数待重测。
 
 ## 项目结构
 
