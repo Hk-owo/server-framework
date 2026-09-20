@@ -111,8 +111,10 @@ done
 (( resources_ok )) || exit 1
 
 # ── 启动服务端（绑前 N 核，N 个事件循环实例各自 SO_REUSEPORT 绑同一端口）
+# 必须先 cd 到可执行文件所在目录：日志是相对工作目录的 "../logs/test.log"，
+# 从别处启动会把它写到仓库外面去（撞上只读目录时进程直接起不来）
 : > "${SERVER_LOG}"
-taskset -c "${SERVER_CORES}" env SF_LOOPS="${LOOPS}" "${BIN}" >> "${SERVER_LOG}" 2>&1 &
+( cd "${BIN%/*}" && exec taskset -c "${SERVER_CORES}" env SF_LOOPS="${LOOPS}" "${BIN}" >> "${SERVER_LOG}" 2>&1 ) &
 SRV_PID=$!
 for _ in $(seq 1 150); do
     curl -s -m 1 "${BASE}/hello" >/dev/null 2>&1 && break

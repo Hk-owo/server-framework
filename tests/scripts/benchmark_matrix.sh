@@ -42,6 +42,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# 清空并重建输出目录。必须放在下面写 lua 脚本**之前**：否则那句 rm -rf 会把
+# 刚写好的 lua 一起删掉，wrk 找不到脚本就退回默认 GET 去打 /echo，
+# 那一格量到的其实是 404 的吞吐
+rm -rf "${OUT}"
+mkdir -p "${OUT}"
+
 LUA_DIR="${OUT}/lua"
 mkdir -p "${LUA_DIR}"
 cat > "${LUA_DIR}/post_echo.lua" <<'LUA'
@@ -138,9 +144,6 @@ stop_server() {
 }
 
 trap 'stop_server' EXIT
-
-rm -rf "${OUT}"
-mkdir -p "${OUT}"
 
 echo "=================================================================="
 echo "  端点 × 并发矩阵压测（Keep-Alive）"
