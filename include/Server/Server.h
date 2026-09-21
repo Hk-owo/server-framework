@@ -43,6 +43,12 @@ private:
     TimeWheelTop mTimeWheel;
     // 时间轮线程跨线程只置这个标志 + 写 eventfd，真正的扫描在事件循环线程做
     std::atomic<bool> mScanRequested{false};
+    // 空闲扫描的"水位"：所有正在等待的连接里，最早的那个等待起点。
+    // 没逼近超时边缘时，scanIdle 只读这一个值就能 O(1) 返回，不必碰连接表——
+    // 遍历代价随连接数线性增长（10 万连接约 0.4ms），而它跑在事件循环线程上，
+    // 每一次都是一记真实的延迟尖刺。
+    // INT64_MAX 表示当前没有任何连接在等待，也就没有东西需要回收
+    int64_t mOldestWaitSince = INT64_MAX;
 
 private:
     // ── user_data 编码：操作类型 + 连接 id ────────────────────────
@@ -68,6 +74,8 @@ private:
     void unregisterConn(uint64_t id);
     // 取消某条连接上那条在途请求（空闲超时用），按 (操作类型, 连接 id) 精确匹配
     bool cancelInFlight(const ConnCtx& connCtx);
+    // 把一个等待起点压进扫描水位（只在事件循环线程调用）
+    void noteWaitStart(int64_t since);
     // 扫描并回收空闲超时的连接（只在事件循环线程调用）
     void scanIdle();
     // 向时间轮注册下一次空闲扫描（每秒一次，自我重注册）

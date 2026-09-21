@@ -89,9 +89,13 @@ struct Server::IouringAwaiter {
         auto conn = connWeak.lock();
         if (!conn) return;                     // 连接已回收，没什么可提交的
         conn->handle = h;
-        // 记下"从此刻起在等客户端"，时间轮的空闲扫描据此判定超时
-        conn->waitingSince.store(nowMs(), std::memory_order_relaxed);
+        // 记下"从此刻起在等客户端"，空闲扫描据此判定超时
+        const int64_t since = nowMs();
+        conn->waitingSince.store(since, std::memory_order_relaxed);
         conn->waiting.store(true, std::memory_order_release);
+        // 顺手把这个起点压进扫描水位。await_suspend 只在事件循环线程被触发
+        // （所有 resume 都来自 handleCqe / eventfd 分支），水位用非原子普通成员即可
+        server->noteWaitStart(since);
         // 每个 IO 事件一条，属于追踪级：默认级别下不产生格式化与入队开销
         LOGGER_TRACE("await_suspend: status={} fd={} handle={}",
                      (int)conn->status, conn->fd, (void*)h.address());
@@ -438,19 +442,33 @@ void Server::scanIdle() {
     if (mConnections.empty()) return;
 
     const int64_t now = nowMs();
+    // 快路径：水位说"没有任何连接在等待"，或者"最老的那个都还没逼近超时边缘"，
+    // 这一轮一个连接都不用碰。这才是空闲扫描的常态——全表遍历只在真有连接
+    // 需要回收时才发生
+    if (mOldestWaitSince == INT64_MAX) return;
+    if (now - mOldestWaitSince < kIdleTimeoutMs) return;
+
+    int64_t oldest = INT64_MAX;        // 本轮重算出的水位
     std::vector<std::shared_ptr<ConnCtx>> expired;
 
     for (auto& [connId, conn] : mConnections) {
         (void)connId;                  // 连接 id 只做 key，取用时用 conn->id
         if (!conn->waiting.load(std::memory_order_acquire)) continue;
+        const int64_t since = conn->waitingSince.load(std::memory_order_relaxed);
+        // 水位要把**所有**还在等待的连接都算上（包括下面被跳过的那些），
+        // 否则回写的水位会偏大，把该扫的轮次误判成"还早"而跳过
+        if (since < oldest) oldest = since;
         // 已经在正常关闭流程里（协程尾部正在等 close 完成）的连接不插手：
         // 取消掉那条 close 反而会让 fd 关不掉
         if (conn->status == OpType::CLOSE) continue;
-        if (now - conn->waitingSince.load(std::memory_order_relaxed) < kIdleTimeoutMs) continue;
+        if (now - since < kIdleTimeoutMs) continue;
         // 先清标志，避免下一轮又把它挑出来
         conn->waiting.store(false, std::memory_order_release);
         expired.push_back(conn);
     }
+    // 回写真实水位。刚被挑出来的那些也计了进去（这一轮它们的起点确实最老），
+    // 所以下一轮可能多扫一次——多扫是保守的，不会漏掉该回收的连接
+    mOldestWaitSince = oldest;
 
     for (auto& conn : expired) {
         LOGGER_INF("Connection idle timeout, cancelling in-flight IO fd={} id={}",
@@ -475,6 +493,12 @@ void Server::scanIdle() {
             conn->waiting.store(true, std::memory_order_release);
         }
     }
+}
+
+// 把一个等待起点压进水位。水位只会被压得更小，而偏小是安全的：扫描最多多跑
+// 几次；反过来，每次真正扫描时都会把它重算成当时的最小值，所以不会偏大漏扫
+void Server::noteWaitStart(int64_t since) {
+    if (since < mOldestWaitSince) mOldestWaitSince = since;
 }
 
 // 取消某条连接上那条在途请求（按 user_data 精确匹配，即按 (操作类型, 连接 id)）。
