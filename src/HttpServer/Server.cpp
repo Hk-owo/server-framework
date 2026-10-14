@@ -9,6 +9,7 @@
 #include "ThreadPool.h"
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <cassert>
@@ -22,10 +23,12 @@
 using namespace std;
 
 // ── ConnCtx ──────────────────────────────────────────────────
-// 连接上下文：单连接的 IO 状态（读写缓冲、短写续传偏移、协程句柄）
+// 连接上下文：单连接的 IO 状态（读缓冲凭证、写缓冲、短写续传偏移、协程句柄）
 //
-// 读写缓冲直接放在这里（不再是指向协程栈的裸指针）：
-// 地址属于连接对象自己，io_uring 提交出去的缓冲区不会随协程栈变动而悬垂。
+// 读方向没有连接自带的缓冲区：数据由内核从共享的 buffer ring 里挑一块填进来
+// （见 setupBufRing），连接只记着"这块给我用的 buffer 是哪个 id"以及它的地址，
+// 解析完立刻把 id 还回去。写方向仍然自带 writeBuffer——响应内容是应用生成的，
+// 大小和时机都只有应用知道，不是"内核挑一块"能表达的东西。
 //
 // 所有权：连接表（mConnections）里的 shared_ptr 是唯一强引用，谁都不该再持一份
 // 强引用（连接持有自己的协程帧，协程帧再持连接就成了环，永远释放不掉），
@@ -38,7 +41,13 @@ struct Server::ConnCtx {
     OpType   status;                        // 协程侧下一步想做什么（提交 IO 时看它）
     uint64_t id;                            // 全局唯一、单调递增，永不复用
     int      fd;
-    std::string readBuffer;                 // 读缓冲
+
+    // 本次 recv 由内核从缓冲池里挑中的那块：
+    //   readBufId  归还凭证（完成事件的 CQE flags 带回来），kNoBufId 表示没占着
+    //   readBufPtr 数据起点，只用于"把数据拷进解析器"这一小段
+    uint16_t    readBufId  = kNoBufId;
+    const char* readBufPtr = nullptr;
+
     std::string writeBuffer;                // 写缓冲（响应内容）
     ssize_t      bytes_read   = 0;
     size_t       write_offset = 0;          // 短写续传偏移
@@ -50,13 +59,17 @@ struct Server::ConnCtx {
     // 空闲超时用：当前是否正等客户端（在读/在写），以及从什么时候开始等
     std::atomic<bool>    waiting{false};
     std::atomic<int64_t> waitingSince{0};
+    // 是否正挂在"等池里腾出 buffer"上。这种连接身上没有在途请求，
+    // 空闲回收不能走 ASYNC_CANCEL，得直接把协程叫醒（见 scanIdle）。
+    // 只在事件循环线程读写
+    bool waitingBuffer = false;
 
     ConnCtx(OpType status, int fd)
-            : status(status), id(0), fd(fd), readBuffer(1 << 16, '\0'), task(std::nullopt) {}
+            : status(status), id(0), fd(fd), task(std::nullopt) {}
 };
 
 // 连接空闲超时：服务器在等客户端（等读或等写）超过这个时长就把连接回收。
-// 没有这道闸，一个连上却不发数据的客户端会永久占住 fd 和 64KB 读缓冲
+// 没有这道闸，一个连上却不发数据的客户端会永久占住 fd 和缓冲池里的一块 buffer
 static constexpr int64_t kIdleTimeoutMs = 5000;
 
 static int64_t nowMs() {
@@ -79,7 +92,8 @@ static struct io_uring_sqe* acquireSqe(struct io_uring& ring) {
 
 // ── IouringAwaiter ───────────────────────────────────────────
 // co_await 挂起时向 io_uring 提交对应的 IO 请求，完成事件到达后由事件循环恢复协程。
-// 缓冲直接取自连接自己（按 status 选读/写缓冲），不需要外部再传指针进来；
+// 读方向的缓冲区由内核从 buffer ring 里挑（提交时只声明 buffer group，不给地址），
+// 写方向仍取连接自己的 writeBuffer；
 // 同样只弱引用连接
 struct Server::IouringAwaiter {
     Server*                server;
@@ -102,7 +116,7 @@ struct Server::IouringAwaiter {
 
         switch (conn->status) {
             case OpType::READ:
-                server->submitRecv(conn->fd, conn->readBuffer, *conn);
+                server->submitRecv(conn->fd, *conn);
                 break;
             case OpType::WRITE:
                 server->submitWrite(conn->fd, conn->writeBuffer, *conn);
@@ -227,6 +241,12 @@ void Server::run(unsigned entries, unsigned flags) {
         exit(1);
     }
 
+    // 缓冲池必须在第一条 recv 之前就绪：此后所有读方向的缓冲都由内核从这个环里挑
+    if (setupBufRing() != 0) {
+        LOGGER_ERROR("buffer ring setup failed, cannot serve reads");
+        exit(1);
+    }
+
     // 这两条 SQE 先留在提交队列里，循环第一次进内核时会一起交出去
     submitMultishotAccept();
     submitEventFdRead();
@@ -346,7 +366,35 @@ void Server::handleCqe(uint64_t tag, int res, unsigned cflags) {
         case OpType::READ: {
             // res < 0：读失败，或被 IORING_OP_ASYNC_CANCEL 取消（-ECANCELED）
             conn->bytes_read = res;
+
+            // 池里一块空闲 buffer 都没有了：内核这次没得可挑（-ENOBUFS），
+            // 也就不带 buffer id，池里一块都没少。不能就这么恢复协程——那会立刻
+            // 再提交一条 recv、再失败，把事件循环空转成 100% CPU。
+            // 把它挂进等待队列，等谁归还了 buffer 再去重投（见 resumeStarved）
+            if (res == -ENOBUFS) {
+                conn->waitingBuffer = true;
+                // 这一次完成事件没有带回数据，连接其实还在等（等池里的 buffer），
+                // 把等待标志放回去，让空闲超时照旧管着它
+                conn->waiting.store(true, std::memory_order_release);
+                LOGGER_TRACE("recv -ENOBUFS fd={} id={}, queued for buffer", conn->fd, conn->id);
+                mBufStarved.push_back(connId);
+                break;
+            }
+
+            // 内核这次从池里挑走了哪一块：buffer id 在 CQE flags 的高 16 位。
+            // 无论 res 是正数、0（对端关闭）还是负数（读错误 / 被取消），
+            // 只要带了这个标志，池里就少了一块，必须记下来等着归还——
+            // 归还的唯一凭证就是它，丢了就等于永久漏掉一块 buffer
+            if (cflags & IORING_CQE_F_BUFFER) {
+                conn->readBufId  = static_cast<uint16_t>(cflags >> IORING_CQE_BUFFER_SHIFT);
+                conn->readBufPtr = static_cast<const char*>(mBufPool)
+                                 + static_cast<size_t>(conn->readBufId) * kBufSize;
+            }
+
             if (!conn->handle || conn->handle.done()) {
+                // 没有协程来消费这块数据了：必须在这儿把 buffer 还回去，
+                // 否则池子会随着这类连接慢慢漏干，最后所有新连接都读不到数据
+                putBackReadBuffer(*conn);
                 submitClose(conn->fd, *conn);
                 break;
             }
@@ -389,6 +437,11 @@ void Server::handleCqe(uint64_t tag, int res, unsigned cflags) {
             // 而不是被唤醒后拿着一个语义对不上的 res 继续跑、再提交第二次 close
             // （那条多余的 close 会打在可能已被内核复用给新连接的 fd 号上）。
             // 协程帧随 ConnCtx 析构时由 task 一并销毁，帧内对象的析构照常发生
+            //
+            // 兜底归还：正常路径上每块 buffer 都在协程 resume 后的那一小段里还掉了
+            // （没有挂起点能把它漏过去），所以这里读到的应该是 kNoBufId、直接返回。
+            // 留着这一手只因为漏还一块是静默的——池子不会报错，只会慢慢变少
+            putBackReadBuffer(*conn);
             unregisterConn(connId);
             break;
         }
@@ -471,6 +524,24 @@ void Server::scanIdle() {
     mOldestWaitSince = oldest;
 
     for (auto& conn : expired) {
+        // 挂"等池里腾出 buffer"上的连接身上没有在途请求：它上一条 recv 以
+        // -ENOBUFS 结束，池里一块都没少，ASYNC_CANCEL 也就没有东西可取消。
+        // 直接塞一个取消码把它从读写循环里叫醒，让它走自己的关闭流程——
+        // 否则它会一直躺在等待队列里，永远等不到那条本该唤醒它的 CQE
+        if (conn->waitingBuffer) {
+            conn->waitingBuffer = false;
+            conn->bytes_read    = -ECANCELED;
+            LOGGER_INF("Connection idle timeout while waiting for buffer, waking fd={} id={}",
+                       conn->fd, conn->id);
+            if (conn->handle && !conn->handle.done()) {
+                conn->handle.resume();
+            } else {
+                // 协程已经没了（不该发生：它一直挂在 recv 上）：没人来走关闭流程，
+                // 那就代发一条 close，别让连接因为"标志已清"而永远留在表里
+                submitClose(conn->fd, *conn);
+            }
+            continue;
+        }
         LOGGER_INF("Connection idle timeout, cancelling in-flight IO fd={} id={}",
                    conn->fd, conn->id);
         // 用 IORING_OP_ASYNC_CANCEL 精确取消这条连接上那条在途的 recv/send，
@@ -514,8 +585,111 @@ bool Server::cancelInFlight(const ConnCtx& connCtx) {
     return true;
 }
 Server::~Server() {
+    // 先注销缓冲环、再拆 ring：io_uring_queue_exit 之后就没法再跟内核谈注册了
+    freeBufRing();
     io_uring_queue_exit(&ring);
 }
+
+// ── provided buffer ring：缓冲池 ──────────────────────────────
+// 把一整池 buffer 注册成一个环交给内核，此后 recv 只说"从哪个池里挑"，由内核
+// 自己选一块空闲的填进去。好处有两层：
+//  1. 内存不再按连接数预分配。以前每条连接构造时就占一块 64KB 读缓冲，哪怕它
+//     一个字节都没发过；现在池是共享的，池子里的块只在"真有 recv 在跑"的时候
+//     才被内核挑走，解析完立刻还回来，所以占用跟着**实际在收数据的连接**走；
+//  2. 只预留虚拟地址，没人写到的页不落物理内存（匿名页按需分配），于是
+//     kBufCount × kBufSize 这个"名义容量"不等于真实占用。
+// bid 直接取数组下标，于是归还时由 id 就能算出地址，不必再维护 id → 地址的表
+int Server::setupBufRing() {
+    mBufPoolBytes = static_cast<size_t>(kBufCount) * kBufSize;
+
+    // MAP_NORESERVE：这是一整块预留，明确告诉内核不用为它留 swap/overcommit 承诺
+    void* pool = mmap(nullptr, mBufPoolBytes, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (pool == MAP_FAILED) {
+        LOGGER_ERROR("bufpool: mmap {} bytes failed: {}", mBufPoolBytes, errno);
+        mBufPool = nullptr;
+        return -1;
+    }
+    mBufPool = pool;
+
+    int err = 0;
+    mBufRing = io_uring_setup_buf_ring(&ring, kBufCount, kBufGroup, 0, &err);
+    if (!mBufRing) {
+        LOGGER_ERROR("bufpool: io_uring_setup_buf_ring(entries={}, bgid={}) failed: {}",
+                     kBufCount, kBufGroup, err);
+        munmap(mBufPool, mBufPoolBytes);
+        mBufPool = nullptr;
+        return -1;
+    }
+
+    // 起步时把整池都挂进环里：环里有多少块，内核就能同时喂多少条 recv
+    for (unsigned i = 0; i < kBufCount; ++i) {
+        io_uring_buf_ring_add(mBufRing,
+                              static_cast<char*>(mBufPool) + static_cast<size_t>(i) * kBufSize,
+                              static_cast<unsigned>(kBufSize),
+                              static_cast<uint16_t>(i),
+                              kBufRingMask, static_cast<int>(i));
+    }
+    io_uring_buf_ring_advance(mBufRing, static_cast<int>(kBufCount));
+
+    LOGGER_INF("bufpool: {} buffers x {}B registered (bgid={}), 虚拟 {} MB 只做预留",
+               kBufCount, kBufSize, kBufGroup, mBufPoolBytes >> 20);
+    return 0;
+}
+
+void Server::freeBufRing() {
+    if (mBufRing) {
+        io_uring_free_buf_ring(&ring, mBufRing, kBufCount, kBufGroup);
+        mBufRing = nullptr;
+    }
+    if (mBufPool) {
+        munmap(mBufPool, mBufPoolBytes);
+        mBufPool = nullptr;
+    }
+}
+
+// 把这次 recv 占用的那块 buffer 还给池子。
+// 调用点必须保证数据已经离开这块内存（feed 进解析器时拷了一份）——归还之后
+// 内核立刻就可能把它交给别的连接的 recv，晚一步就是数据被盖掉
+void Server::putBackReadBuffer(ConnCtx& connCtx) {
+    if (connCtx.readBufId == kNoBufId) return;   // 这次没占着（比如 -ENOBUFS）
+
+    const uint16_t bid = connCtx.readBufId;
+    connCtx.readBufId  = kNoBufId;               // 先清凭证：同一块不会被还两次
+    connCtx.readBufPtr = nullptr;
+
+    io_uring_buf_ring_add(mBufRing,
+                          static_cast<char*>(mBufPool) + static_cast<size_t>(bid) * kBufSize,
+                          static_cast<unsigned>(kBufSize), bid, kBufRingMask, 0);
+    io_uring_buf_ring_advance(mBufRing, 1);
+
+    // 刚腾出一块，正好喂给一个在等的连接（一块 buffer 只够喂一条 recv）
+    resumeStarved();
+}
+
+// 池里腾出了一块 buffer：从等待队列里挑一个连接，把它那条 recv 重新提交。
+// 一对一——多出来的等待者等下一次归还。没有 buffer 就继续挂着，比直接关掉
+// 连接温和：池子是暂时满，不是这条连接有什么错
+void Server::resumeStarved() {
+    while (!mBufStarved.empty()) {
+        const uint64_t starvedId = mBufStarved.front();
+        mBufStarved.pop_front();
+
+        auto it = mConnections.find(starvedId);
+        if (it == mConnections.end()) continue;   // 连接已经回收，等待资格作废
+        ConnCtx& conn = *it->second;
+        // 只重投"确实还挂在这次读上"的：等待标志还在、协程仍停在那条 recv 上。
+        // 标志被 scanIdle 清掉（这连接已经超时被叫醒去关闭流程了）就不再重投
+        if (!conn.waitingBuffer || conn.status != OpType::READ) continue;
+        if (!conn.handle || conn.handle.done()) continue;
+
+        conn.waitingBuffer = false;
+        LOGGER_TRACE("bufpool: refeed recv fd={} id={}", conn.fd, conn.id);
+        submitRecv(conn.fd, conn);
+        return;
+    }
+}
+
 void Server::Get(std::string pattern, Router::Handler handler) {
     LOGGER_INF("Register GET handler for: {}", pattern);
     mRouter.Get(std::move(pattern), std::move(handler));
@@ -557,14 +731,19 @@ int Server::submitAccept() {
     return 0;
 }
 
-void Server::submitRecv(int fd, std::string& buffer, ConnCtx& connCtx) {
+void Server::submitRecv(int fd, ConnCtx& connCtx) {
     struct io_uring_sqe* sqe = acquireSqe(ring);
     if (!sqe) {
         LOGGER_ERROR("submitRecv: SQ full, closing fd={}", fd);
         submitClose(fd, connCtx);
         return;
     }
-    io_uring_prep_recv(sqe, fd, buffer.data(), buffer.size(), 0);
+    // 不自己给地址：buf=NULL + len=0 配上 IOSQE_BUFFER_SELECT，等于告诉内核
+    // "从 bgid 这个池里挑一块空闲的填进去"。挑中的那块以 buffer id 的形式随完成
+    // 事件回来（CQE flags 高 16 位），那是归还它、把内存还给池子的唯一凭证
+    io_uring_prep_recv(sqe, fd, nullptr, 0, 0);
+    sqe->flags |= IOSQE_BUFFER_SELECT;
+    sqe->buf_group = static_cast<uint16_t>(kBufGroup);
     // 标签带操作类型：这条 recv 的完成事件以后只会走 READ 分支，
     // 跟这条连接此后是不是被决定关闭没有关系
     io_uring_sqe_set_data64(sqe, packTag(OpType::READ, connCtx.id));
@@ -637,6 +816,18 @@ coro::Task<void> Server::clientConnect(std::weak_ptr<ConnCtx> connWeak) {
         co_await IouringAwaiter{this, connWeak};
 
         ssize_t n = connState->bytes_read;
+
+        // 数据落在内核刚从池里挑中的那块 buffer 上（地址在 readBufPtr）。
+        // 先拷进解析器（feed 内部 append 了一份），再归还——归还意味着这块内存
+        // 立刻可能被别的连接的 recv 写进来，所以这个指针绝不允许跨过任何挂起点。
+        // 数据可能不足一个完整请求，那没关系：解析器自己累积（见 HttpParser::buf_）
+        if (n > 0 && connState->readBufPtr != nullptr) {
+            httpParser.feed(connState->readBufPtr, static_cast<size_t>(n));
+        }
+        // 无论读成功、对端关闭还是出错，都在这里把 buffer 还给池子。
+        // 归还凭证是 readBufId（完成事件的 CQE flags 带回来的），由它反算出地址
+        putBackReadBuffer(*connState);
+
         if (n <= 0) {
             if (n == -ECANCELED) {
                 // 空闲超时扫描用 IORING_OP_ASYNC_CANCEL 取消了这条在途 recv：
@@ -649,8 +840,6 @@ coro::Task<void> Server::clientConnect(std::weak_ptr<ConnCtx> connWeak) {
             }
             break;
         }
-
-        httpParser.feed(connState->readBuffer.data(), n);
 
         if (auto optReq = httpParser.try_parse()) {
                 HttpRequest& req = *optReq;

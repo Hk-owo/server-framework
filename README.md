@@ -10,6 +10,8 @@
 
 - **全链路 io_uring** —— accept / recv / send / close / eventfd 读取全部作为 SQE 提交，不为 IO 建立任何线程；multishot accept 一次提交即可持续接收新连接；事件循环用 `io_uring_for_each_cqe` 批量遍历完成队列、`io_uring_cq_advance` 一次性标记消费；**提交侧同样攒批**——`submitXxx` 只把 SQE 放进提交队列、不各自 `io_uring_submit`，由事件循环在每轮末尾用 `io_uring_submit_and_wait_timeout` 把"交出本轮 SQE"与"等待下一个完成事件"合并成**一次 `io_uring_enter`**。
 
+- **读缓冲由内核从环里挑（provided buffer ring）** —— 读缓冲不再由用户按连接预分配：启动时把 32768 块 8KB 缓冲注册成一个环（`IORING_REGISTER_PBUF_RING`），提交读只声明 `IOSQE_BUFFER_SELECT` + `buf_group`，**由内核自己从环里取一块空闲的填进去**，完成事件的 `CQE flags` 高 16 位带回它挑中的 `buffer id`。连接不再持有任何读缓冲——`ConnCtx` 只记着这个 id 和它对应的地址，数据拷进 `HttpParser` 后**立刻按 id 把这块 buffer 还给环**（`io_uring_buf_ring_add` + `advance`），池子循环复用。于是内存占用从"连接数 × 64KB"（10 万连接 ≈ 6.4GB，连一个字节都没发过的空闲连接也占着）变成"当前真在等读的那几块"，池本身只 `mmap(MAP_NORESERVE)` 预留虚拟地址、没人写到的页不落物理内存。池暂时取空时内核给 `recv` 回 `-ENOBUFS`，此时不关连接也不空转重投，而是把连接挂进等待队列，**等谁归还一块 buffer 再一对一重投它那条 `recv`**；这类连接身上没有在途请求，空闲超时对它不走 `ASYNC_CANCEL`，而是直接塞一个 `-ECANCELED` 把协程叫醒走同一条关闭流程。
+
 - **C++23 协程连接模型** —— 每个连接一个协程，读写通过 `co_await IouringAwaiter{...}` 挂起，`await_suspend` 提交对应 IO，CQE 回到事件循环后恢复。协程帧挂在连接对象里，连接回收即协程结束，不需要状态机或回调金字塔。
 
 - **同步快速路径 + 显式异步** —— `server.Get(...)` 注册的 handler **直接在事件循环线程执行**：没有任务入队、没有线程唤醒、没有跨线程协程恢复。实测 `/json` 4 线程 100 连接约 **20 万 req/s**（12 核单实例；各并发级别的完整数据见「性能实测」）。耗时 handler 用 `GetAsync`/`PostAsync` 注册，`QueryAwaiter` 把任务投进全局线程池，后台线程完成后经 `eventfd` 唤醒事件循环恢复协程。等待唤醒用的是 io_uring 的 **read**（由 read 把 eventfd 计数取走并清零）——若改用 `poll_add` 只监听可读而不消费计数，eventfd 从第一次写入起就永久可读，事件循环会空转一整个核。`resumePending` 的 CAS 保证同一协程不会被重复入队。
@@ -20,7 +22,7 @@
 
 - **连接生命周期用弱引用 + 单调递增连接 id** —— 连接表独占持有连接对象，**所有跨线程或跨生命周期边界的引用都是 `weak_ptr`**：投进线程池的异步任务、待恢复协程队列都在取用时 `lock()` 确认存活，拿不到就丢弃。协程内部则用裸指针——连接持有协程帧，所以"协程在跑"就蕴含"连接活着"；这个不变式不能改用 `shared_ptr` 表达，否则连接与协程帧会互相持有成环。回到事件循环这一路则**既不存指针、也不解引用对象**：`user_data` 里放的是 `(操作类型, 连接 id)` 打包成的 64 位标签，`handleCqe` 先按 id 回表，查不到就是陈旧事件——id 单调递增、永不复用，所以"上一代连接"的 CQE 不可能撞上"新一代连接"，也就不需要额外的一代代次（裸指针会被 allocator 复用，连接 id 不会）。
 
-- **时间轮驱动的空闲超时** —— 四级级联时间轮（`ms → sec → min → hour`，最小刻度 1ms，由独立的 io_uring 1ms 超时驱动并带追赶机制）。当前接入点是**连接空闲超时**：时间轮每秒唤醒一次事件循环，扫描连接表回收"服务器在等客户端却一直等不到"的连接（阈值 5s），避免一个连上却不发数据的客户端永久占住 fd 和 64KB 读缓冲。扫描对超时连接发一条 **`IORING_OP_ASYNC_CANCEL`**，按 `(操作类型, 连接 id)` 精确取消它那条在途的 `recv`/`send`——被取消的请求以 `-ECANCELED` 正常完成，协程照旧从 READ/WRITE 分支走完自己的关闭流程（协程尾部提交 `close`）。比 `shutdown + close` 更干净：**全程只有一条在途请求**，同一个 fd 上不会出现两条 close（第二条会打在可能已被内核复用给新连接的 fd 号上）；被取消的请求不再持有 socket 引用，随后的 close 才能真正关掉 socket 并把 FIN 发出去；而且取消本身就是一条 SQE，不必在事件循环里夹一个同步的 `shutdown` 系统调用。扫描也**不是每秒硬扫一遍连接表**：`Server` 记着所有等待连接里最早的那个等待起点（水位），没逼近超时边缘时 `scanIdle` 读这一个值就 O(1) 返回。遍历代价随连接数线性增长（10 万连接约 0.4ms），而它跑在事件循环线程上，每一次都是一记真实的延迟尖刺。
+- **时间轮驱动的空闲超时** —— 四级级联时间轮（`ms → sec → min → hour`，最小刻度 1ms，由独立的 io_uring 1ms 超时驱动并带追赶机制）。当前接入点是**连接空闲超时**：时间轮每秒唤醒一次事件循环，扫描连接表回收"服务器在等客户端却一直等不到"的连接（阈值 5s），避免一个连上却不发数据的客户端永久占住 fd 和缓冲环里的一块 buffer。扫描对超时连接发一条 **`IORING_OP_ASYNC_CANCEL`**，按 `(操作类型, 连接 id)` 精确取消它那条在途的 `recv`/`send`——被取消的请求以 `-ECANCELED` 正常完成，协程照旧从 READ/WRITE 分支走完自己的关闭流程（协程尾部提交 `close`）。比 `shutdown + close` 更干净：**全程只有一条在途请求**，同一个 fd 上不会出现两条 close（第二条会打在可能已被内核复用给新连接的 fd 号上）；被取消的请求不再持有 socket 引用，随后的 close 才能真正关掉 socket 并把 FIN 发出去；而且取消本身就是一条 SQE，不必在事件循环里夹一个同步的 `shutdown` 系统调用。扫描也**不是每秒硬扫一遍连接表**：`Server` 记着所有等待连接里最早的那个等待起点（水位），没逼近超时边缘时 `scanIdle` 读这一个值就 O(1) 返回。遍历代价随连接数线性增长（10 万连接约 0.4ms），而它跑在事件循环线程上，每一次都是一记真实的延迟尖刺。
 
 - **HTTP/1.1 完整实现** —— 请求行与 Header 解析、URI Query 自动解码、`Content-Length` 与 `Chunked Transfer-Encoding`、Keep-Alive 长连接；发送侧支持**短写续传**（记录断点，上层业务无感知）。
 
@@ -38,9 +40,9 @@
 
 | 项目 | 要求 |
 |------|------|
-| 操作系统 | Linux 内核 ≥ 5.10（推荐 ≥ 6.0 以完整支持 multishot accept） |
+| 操作系统 | Linux 内核 ≥ 5.19（provided buffer ring；推荐 ≥ 6.0 以完整支持 multishot accept） |
 | 编译器 | 支持 C++23 的 GCC 或 Clang |
-| 依赖 | `liburing`、`spdlog`、`fmt`、`nlohmann-json` |
+| 依赖 | `liburing`（需 `io_uring_setup_buf_ring` 等缓冲环接口）、`spdlog`、`fmt`、`nlohmann-json` |
 | 构建 | CMake ≥ 3.20 |
 
 ### 构建与运行
@@ -107,7 +109,8 @@ python3 tests/scripts/benchmark_report.py build/Release/benchmark/matrix   # 汇
 │ 服务层  Server            src/HttpServer/Server.cpp                │
 │         单线程 io_uring 事件循环 + 每连接一个协程                   │
 │         ConnCtx / IouringAwaiter / QueryAwaiter                    │
-│         状态：mConnections(按连接 id) / mPendingResumes / mTimeWheel / mEventFd│
+│         状态：mConnections(按连接 id) / mPendingResumes / mTimeWheel│
+│              mEventFd / 缓冲环 mBufRing（读缓冲由内核从环里挑）      │
 ├────────────────────────────────────────────────────────────────────┤
 │ 协议层  HttpParser / HttpResponse                                 │
 ├────────────────────────────────────────────────────────────────────┤
@@ -121,9 +124,13 @@ python3 tests/scripts/benchmark_report.py build/Release/benchmark/matrix   # 汇
 ```
 accept (multishot CQE)
   └─ 建 ConnCtx → 启动连接协程
-       └─ co_await IouringAwaiter{READ}            ← 挂起，提交 recv
-            CQE 到达 → handleCqe → 恢复协程
-              ├─ 解析：HttpParser.feed + try_parse
+       └─ co_await IouringAwaiter{READ}       ← 挂起，提交 recv
+                                                 （IOSQE_BUFFER_SELECT，不给地址，
+                                                  由内核从缓冲环里挑一块空闲的）
+            CQE 到达 → handleCqe（从 CQE flags 取回 buffer id）→ 恢复协程
+              ├─ 解析：HttpParser.feed（把环里那块的数据拷进解析器）
+              │        + try_parse
+              ├─ 归还：按 buffer id 把这块 buffer 还给环（io_uring_buf_ring_add）
               ├─ 路由：Router.match
               ├─ 执行：同步 handler 直接调用
               │        异步 handler → co_await QueryAwaiter
@@ -172,6 +179,51 @@ accept (multishot CQE)
 
 原则：**所有跨边界的引用都是弱的；回到事件循环先按标签（id + 操作类型）定位与分流，再取强引用保活。**
 
+### 读缓冲：内核从环里挑
+
+缓冲不再由用户按连接预分配，而是启动时一次性注册成一个环交给内核：
+
+```cpp
+// setupBufRing()：32768 块 8KB，只预留虚拟地址，物理页按需落
+mBufPool = mmap(nullptr, kBufCount * kBufSize, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+mBufRing = io_uring_setup_buf_ring(&ring, kBufCount, kBufGroup, 0, &err);
+for (unsigned i = 0; i < kBufCount; ++i)         // 起步时把整池挂进环
+    io_uring_buf_ring_add(mBufRing, pool + i * kBufSize, kBufSize, i, kBufRingMask, i);
+io_uring_buf_ring_advance(mBufRing, kBufCount);
+```
+
+提交读时不带地址，只声明"从哪个池里挑"：
+
+```cpp
+io_uring_prep_recv(sqe, fd, nullptr, 0, 0);
+sqe->flags     |= IOSQE_BUFFER_SELECT;
+sqe->buf_group  = kBufGroup;                     // 内核自己挑一块空闲的填进去
+```
+
+完成事件把挑中的 `buffer id` 带在 `CQE flags` 高 16 位（`IORING_CQE_F_BUFFER`），
+`handleCqe` 记下它、由 id 反算出数据地址再恢复协程。协程把数据 `feed` 进 `HttpParser`
+（内部 `append` 了一份）之后**立刻归还**——归还之后内核马上可能把它交给别的连接，
+所以这个指针不允许跨过任何挂起点。无论这次读是成功、对端关闭还是被取消，只要
+CQE 带了 buffer id 就必须还（`ConnCtx::readBufId` 就是那张归还凭证，还完即清 `kNoBufId`）。
+
+| | 现在 |
+|---|---|
+| 连接侧 | 不持有读缓冲，只借池里的一块，解析完即还 |
+| 内存占用 | 跟随"当前在途 recv 的块数"，而不是连接表大小 |
+| 预留方式 | `MAP_NORESERVE` 只占虚拟地址，没写到的页不落物理内存 |
+| 空闲连接 | 5s 超时回收时连 buffer 一起还回池子，不再按连接长期占着 64KB |
+
+池取空时内核返回 `-ENOBUFS`（这一次**不**带 buffer id，池里一块都没少）。这条路径不能
+直接恢复协程——那会立刻再提交、再失败，把事件循环空转成 100% CPU——所以把连接挂进
+`mBufStarved` 队列，等任一归还点把 buffer 还给环时一对一重投它那条 `recv`
+（`resumeStarved`）。这类连接身上没有在途请求，空闲超时对它也就不能用
+`ASYNC_CANCEL`：`scanIdle` 直接往 `bytes_read` 里塞一个 `-ECANCELED` 并恢复协程，
+让它走和其他连接完全一样的关闭流程。
+
+> `IORING_REGISTER_PBUF_RING` 只接受 ≤ 32768 且为 2 的幂的条目数（再大直接 `-EINVAL`），
+> 所以池定在 32768 条 × 8KB。`Server.h` 用 `static_assert` 把这两个约束钉在编译期。
+
 ### 空闲超时
 
 ```
@@ -182,6 +234,8 @@ TimeWheelTop（独立线程，1ms 推进 ms 轮）
                   └─ 精确取消该连接上那条在途的 recv/send（按 (操作类型, 连接 id) 匹配）
                        └─ 被取消的请求以 -ECANCELED 完成 → 协程从 READ/WRITE 分支走完正常关闭流程
                             └─ 协程尾部提交 close（此时那条 recv 已经不持有 socket 引用）
+             （挂在"等缓冲环腾出 buffer"上的连接身上没有在途请求可取消：
+                直接把 -ECANCELED 塞进 bytes_read 并恢复协程，走同一条关闭流程）
 ```
 
 扫描放在**事件循环线程**（它要遍历连接表、还要提交 io_uring 操作），时间轮线程只置标志并唤醒。
@@ -297,6 +351,7 @@ tests/scripts/            # benchmark.sh / test_stress.sh / test_low_pressure.sh
 1. **负载分布依赖内核哈希**：`SO_REUSEPORT` 按连接 4 元组分发，客户端 IP 集中（NAT 之后）或长连接场景下可能倾斜，目前没有主动重平衡的手段。
 2. **`listen(fd, 10)` backlog 偏小**：突发连接下 accept 会积压。
 3. **路由前缀匹配是线性扫描**：当前路由表小（6 条）无影响，路由数量上升后需要换成前缀树。
+4. **在途 `recv` 数量受内核条目数限制**：缓冲区环最多 32768 条（`IORING_REGISTER_PBUF_RING` 的硬上限），因此单个实例同时最多 32768 条 `recv` 在途；超出的连接会在 `mBufStarved` 里排队等 buffer 归还——不失败，但会带上排队延迟。要更高并发只能拆多个 `bgid`（一条 `recv` 只能点名一个 `bgid`）或多实例。
 
 ---
 

@@ -12,7 +12,9 @@
 
 #include <atomic>
 #include <coroutine>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -50,6 +52,32 @@ private:
     // INT64_MAX 表示当前没有任何连接在等待，也就没有东西需要回收
     int64_t mOldestWaitSince = INT64_MAX;
 
+    // ── provided buffer ring：缓冲由内核从环里挑，不再每连接预分配 ──────
+    // 以前每条连接自带一块 64KB 读缓冲（构造时就分配，空闲连接也占着；
+    // 10 万连接约 6.4GB）。现在把 kBufCount 块 buffer 注册成一个环交给内核：
+    // recv 提交时只声明"请从 bgid 这个池里挑一块空的"，内核自己选一块填进去，
+    // 完成事件里把它的 buffer id 带回来。池是共享、循环复用的，于是内存占用
+    // 跟着**实际在收数据的连接**走，而不是跟着连接表大小走
+    //
+    // kBufCount 取的是内核允许的上限：IORING_REGISTER_PBUF_RING 只接受条目数
+    // ≤ 32768 且为 2 的幂，再大直接 -EINVAL（条目更多只能靠多个 bgid，而一条
+    // recv 只能点名一个 bgid，不划算）。单块因此定在 8KB，名义容量仍是 256MB
+    static constexpr unsigned kBufCount  = 32768;        // 池条目数（须为 2 的幂，≤ 32768）
+    static constexpr size_t   kBufSize   = 8192;         // 单块 buffer 大小
+    static constexpr int      kBufGroup  = 0;            // buffer group id（bgid）
+    static constexpr int      kBufRingMask = static_cast<int>(kBufCount) - 1;
+    // 内核的硬性要求，写错了注册会在运行期 -EINVAL，不如编译期拦住
+    static_assert((kBufCount & (kBufCount - 1)) == 0 && kBufCount <= 32768,
+                  "buffer ring 条目数必须是 2 的幂且不超过 32768");
+    // "这次 recv 没占着 buffer"。0xFFFF 是无效 bid，池子永远发不到这个编号
+    static constexpr uint16_t kNoBufId   = 0xFFFF;
+
+    struct io_uring_buf_ring* mBufRing = nullptr;   // 挂在 ring 上、交给内核挑的缓冲环
+    void*  mBufPool      = nullptr;                 // 池基址（只预留虚拟地址，物理页按需落）
+    size_t mBufPoolBytes = 0;
+    // 池暂时空了（recv 拿到 -ENOBUFS）时挂在这儿的连接 id，等有 buffer 归还再重投
+    std::deque<uint64_t> mBufStarved;
+
 private:
     // ── user_data 编码：操作类型 + 连接 id ────────────────────────
     // 64 位里高 4 位放操作类型（recv / send / close / accept / eventfd），
@@ -81,6 +109,15 @@ private:
     // 向时间轮注册下一次空闲扫描（每秒一次，自我重注册）
     void scheduleScan();
 
+    // 建缓冲池并注册给内核（run() 里、提交第一条 SQE 之前调用）
+    int  setupBufRing();
+    // 注销缓冲环并释放池（析构时调用，必须早于 io_uring_queue_exit）
+    void freeBufRing();
+    // 归还某连接这次 recv 占用的 buffer，顺手把腾出来的那块喂给在等的连接
+    void putBackReadBuffer(ConnCtx& connCtx);
+    // 池里刚空出一块 buffer：挑一个挂在等待队列里的连接重投它那条 recv
+    void resumeStarved();
+
 public:
     int listen(const std::string& bind,const std::string& port);
     // 默认开启 DEFER_TASKRUN | SINGLE_ISSUER：事件循环线程是这个 ring 唯一的提交者，
@@ -97,7 +134,8 @@ public:
     ~Server();
     int submitMultishotAccept();
     coro::Task<void> clientConnect(std::weak_ptr<ConnCtx> connWeak);
-    void submitRecv(int fd, std::string &buffer,ConnCtx& connCtx);
+    // 不再收用户给的缓冲区：地址由内核从 buffer ring 里挑（见 setupBufRing）
+    void submitRecv(int fd, ConnCtx& connCtx);
     void submitWrite(int fd, std::string &msg, ConnCtx &connCtx);
     void submitClose(int fd, ConnCtx &connCtx);
     int submitAccept();
