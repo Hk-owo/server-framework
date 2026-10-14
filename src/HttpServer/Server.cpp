@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <cassert>
 #include <cerrno>
+#include <cstdlib>
 #include <atomic>
 #include <optional>
 #include <memory>
@@ -693,34 +694,60 @@ int Server::setupBufRing() {
     }
     mBufPool = pool;
 
+    // 条目数：默认 kBufCount，可用 SF_BUF_COUNT 覆盖（要配合调大的 memlock 用）
+    unsigned want = kBufCount;
+    if (const char* env = std::getenv("SF_BUF_COUNT")) {
+        const long v = std::atol(env);
+        if (v >= static_cast<long>(kMinBufCount) && v <= static_cast<long>(kMaxBufCount) &&
+            (v & (v - 1)) == 0) {
+            want = static_cast<unsigned>(v);
+        } else {
+            LOGGER_WARN("bufpool: 忽略非法 SF_BUF_COUNT={}（须为 2 的幂且不超过 {}）",
+                        env, kMaxBufCount);
+        }
+    }
+
+    // 逐级减半注册，直到成功或到下限。注册给内核的 ring 内存会被 pin 住、计入
+    // RLIMIT_MEMLOCK（本机默认 8MB，且硬限制也是 8MB），而多实例下每个实例都要
+    // 注册一个——不降级的话，第 N 个实例会拿着 -ENOMEM 直接退出，整个进程跟着
+    // exit(1)，比"这个实例池小一点"糟得多
     int err = 0;
-    mBufRing = io_uring_setup_buf_ring(&ring, kBufCount, kBufGroup, 0, &err);
+    for (unsigned n = want; n >= kMinBufCount; n /= 2) {
+        mBufRing = io_uring_setup_buf_ring(&ring, n, kBufGroup, 0, &err);
+        if (mBufRing) {
+            mBufCount = n;
+            break;
+        }
+        LOGGER_WARN("bufpool: io_uring_setup_buf_ring(entries={}) failed: {}{}",
+                    n, err, n > kMinBufCount ? ", retrying with half" : "");
+    }
     if (!mBufRing) {
-        LOGGER_ERROR("bufpool: io_uring_setup_buf_ring(entries={}, bgid={}) failed: {}",
-                     kBufCount, kBufGroup, err);
+        LOGGER_ERROR("bufpool: cannot register any buffer ring (down to {} entries), "
+                     "raise RLIMIT_MEMLOCK or lower SF_LOOPS", kMinBufCount);
         munmap(mBufPool, mBufPoolBytes);
         mBufPool = nullptr;
         return -1;
     }
+    mBufRingMask = static_cast<int>(mBufCount) - 1;
 
     // 起步时把整池都挂进环里：环里有多少块，内核就能同时喂多少条 recv
-    for (unsigned i = 0; i < kBufCount; ++i) {
+    for (unsigned i = 0; i < mBufCount; ++i) {
         io_uring_buf_ring_add(mBufRing,
                               static_cast<char*>(mBufPool) + static_cast<size_t>(i) * kBufSize,
                               static_cast<unsigned>(kBufSize),
                               static_cast<uint16_t>(i),
-                              kBufRingMask, static_cast<int>(i));
+                              mBufRingMask, static_cast<int>(i));
     }
-    io_uring_buf_ring_advance(mBufRing, static_cast<int>(kBufCount));
+    io_uring_buf_ring_advance(mBufRing, static_cast<int>(mBufCount));
 
     LOGGER_INF("bufpool: {} buffers x {}B registered (bgid={}), 虚拟 {} MB 只做预留",
-               kBufCount, kBufSize, kBufGroup, mBufPoolBytes >> 20);
+               mBufCount, kBufSize, kBufGroup, mBufPoolBytes >> 20);
     return 0;
 }
 
 void Server::freeBufRing() {
     if (mBufRing) {
-        io_uring_free_buf_ring(&ring, mBufRing, kBufCount, kBufGroup);
+        io_uring_free_buf_ring(&ring, mBufRing, mBufCount, kBufGroup);
         mBufRing = nullptr;
     }
     if (mBufPool) {
@@ -737,7 +764,7 @@ void Server::putBackReadBuffer(uint16_t bid) {
 
     io_uring_buf_ring_add(mBufRing,
                           static_cast<char*>(mBufPool) + static_cast<size_t>(bid) * kBufSize,
-                          static_cast<unsigned>(kBufSize), bid, kBufRingMask, 0);
+                          static_cast<unsigned>(kBufSize), bid, mBufRingMask, 0);
     io_uring_buf_ring_advance(mBufRing, 1);
 
     // 刚腾出一块，正好喂给一个在等的连接（一块 buffer 只够喂一条 recv）
