@@ -115,6 +115,14 @@ std::string HttpRequest::get_param_value(const std::string& key) const {
 // ==================== HttpParser 实现 ====================
 
 void HttpParser::feed(const char* data, std::size_t len) {
+    // 先判上限再 append。用减法而不是 size() + len，避免 len 极大时把和算溢出，
+    // 反而绕过检查
+    if (len > kMaxBufferSize - buf_.size()) {
+        // 超限：一个字节都不再收（buf_ 冻结在超限前的内容），只留标记让上层收尾。
+        // 继续收只会让这条连接占的内存一直涨，而它已经不可能解析出完整请求了
+        overflowed_ = true;
+        return;
+    }
     buf_.append(data, len);
 }
 
@@ -137,6 +145,7 @@ std::optional<HttpRequest> HttpParser::try_parse() {
 
 void HttpParser::reset() {
     buf_.clear();
+    overflowed_ = false;
 }
 
 bool HttpParser::parse_request_line(HttpRequest& req) {

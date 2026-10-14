@@ -28,6 +28,7 @@ private:
     struct ConnCtx;
     struct IouringAwaiter;
     struct QueryAwaiter;
+    struct WaitDataAwaiter;
 private:
     io_uring ring;
     int mSockFd,mEventFd;
@@ -100,8 +101,10 @@ private:
     uint64_t registerConn(const std::shared_ptr<ConnCtx>& conn);
     // 从连接表摘除。连接对象由调用方手上那份 shared_ptr 保活到本次事件处理结束
     void unregisterConn(uint64_t id);
-    // 取消某条连接上那条在途请求（空闲超时用），按 (操作类型, 连接 id) 精确匹配
-    bool cancelInFlight(const ConnCtx& connCtx);
+    // 取消某条连接上那条在途请求，按 (操作类型, 连接 id) 精确匹配
+    bool cancelInFlight(const ConnCtx& connCtx, OpType op);
+    // 真的把 close 提交出去（submitClose 会在读方向还在途时先取消、把这一步推后）
+    void submitCloseNow(int fd, ConnCtx& connCtx);
     // 把一个等待起点压进扫描水位（只在事件循环线程调用）
     void noteWaitStart(int64_t since);
     // 扫描并回收空闲超时的连接（只在事件循环线程调用）
@@ -113,8 +116,9 @@ private:
     int  setupBufRing();
     // 注销缓冲环并释放池（析构时调用，必须早于 io_uring_queue_exit）
     void freeBufRing();
-    // 归还某连接这次 recv 占用的 buffer，顺手把腾出来的那块喂给在等的连接
-    void putBackReadBuffer(ConnCtx& connCtx);
+    // 归还一块 provided buffer（handleCqe 里 feed 完就还，凭证是 CQE 带回的 buffer id），
+    // 顺手把腾出来的那块喂给在等的连接
+    void putBackReadBuffer(uint16_t bid);
     // 池里刚空出一块 buffer：挑一个挂在等待队列里的连接重投它那条 recv
     void resumeStarved();
 
@@ -134,7 +138,8 @@ public:
     ~Server();
     int submitMultishotAccept();
     coro::Task<void> clientConnect(std::weak_ptr<ConnCtx> connWeak);
-    // 不再收用户给的缓冲区：地址由内核从 buffer ring 里挑（见 setupBufRing）
+    // multishot recv：一次武装后持续产 CQE。缓冲区仍由内核从 buffer ring 里挑
+    // （IOSQE_BUFFER_SELECT），所以它必须配 provided buffer 用
     void submitRecv(int fd, ConnCtx& connCtx);
     void submitWrite(int fd, std::string &msg, ConnCtx &connCtx);
     void submitClose(int fd, ConnCtx &connCtx);

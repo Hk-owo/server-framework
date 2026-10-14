@@ -23,12 +23,18 @@
 using namespace std;
 
 // ── ConnCtx ──────────────────────────────────────────────────
-// 连接上下文：单连接的 IO 状态（读缓冲凭证、写缓冲、短写续传偏移、协程句柄）
+// 连接上下文：单连接的 IO 状态（解析器、待处理读结果、写缓冲、协程句柄）
 //
 // 读方向没有连接自带的缓冲区：数据由内核从共享的 buffer ring 里挑一块填进来
-// （见 setupBufRing），连接只记着"这块给我用的 buffer 是哪个 id"以及它的地址，
-// 解析完立刻把 id 还回去。写方向仍然自带 writeBuffer——响应内容是应用生成的，
-// 大小和时机都只有应用知道，不是"内核挑一块"能表达的东西。
+// （见 setupBufRing），handleCqe 把这块的内容拷进 parser 之后立刻按 buffer id
+// 还给池子——所以 buffer 的生命周期完全在 handleCqe 内部闭环，连接上不留凭证。
+// 写方向仍然自带 writeBuffer：响应内容是应用生成的，大小和时机只有应用知道，
+// 不是"内核挑一块"能表达的东西。
+//
+// 解析被拆成了两半，parser 因此必须挂在连接上而不是协程栈上：
+//   feed（把字节 append 进累积缓冲）在 handleCqe 里做，好让那块 buffer 能马上归还；
+//   try_parse（从累积缓冲里切出请求）留到协程里做，因为切出来之后要路由、要执行
+//   handler、要写响应——那些都要能挂起，而 handleCqe 是普通函数挂不了。
 //
 // 所有权：连接表（mConnections）里的 shared_ptr 是唯一强引用，谁都不该再持一份
 // 强引用（连接持有自己的协程帧，协程帧再持连接就成了环，永远释放不掉），
@@ -42,15 +48,18 @@ struct Server::ConnCtx {
     uint64_t id;                            // 全局唯一、单调递增，永不复用
     int      fd;
 
-    // 本次 recv 由内核从缓冲池里挑中的那块：
-    //   readBufId  归还凭证（完成事件的 CQE flags 带回来），kNoBufId 表示没占着
-    //   readBufPtr 数据起点，只用于"把数据拷进解析器"这一小段
-    uint16_t    readBufId  = kNoBufId;
-    const char* readBufPtr = nullptr;
+    // 解析状态随连接走：handleCqe 往里喂字节，协程从里面切请求（见文件头说明）
+    HttpParser          parser;
+    // 每次读完成的结果队列：>0 = 读到的字节数（数据已经 feed 进 parser），
+    // 0 = 对端关闭，<0 = 出错或被取消；kReadTooLarge 表示累积已超上限
+    std::deque<int32_t> pendingReads;
+    // 协程是否正挂在"等数据"上。只有它为 true，handleCqe 收到读事件才 resume；
+    // 协程挂在别处（比如正等 send 完成）时只入队，让它自己回到循环来取——
+    // 这就是"不在错误的状态下 resume"。只在事件循环线程读写
+    std::atomic<bool>   awaitingRead{false};
 
     std::string writeBuffer;                // 写缓冲（响应内容）
-    ssize_t      bytes_read   = 0;
-    size_t       write_offset = 0;          // 短写续传偏移
+    size_t      write_offset = 0;           // 短写续传偏移
 
     std::atomic<bool> resumePending{false};
     std::optional<coro::Task<void>> task;
@@ -63,10 +72,20 @@ struct Server::ConnCtx {
     // 空闲回收不能走 ASYNC_CANCEL，得直接把协程叫醒（见 scanIdle）。
     // 只在事件循环线程读写
     bool waitingBuffer = false;
+    // 这条 fd 上是否有一条 multishot recv 在途。它是唯一握着 socket 引用的东西，
+    // 所以 close 之前必须先让它结束：否则 close 只摘掉 fd、socket 还活着、
+    // FIN 发不出去，客户端会一直等（见 submitClose）。只在事件循环线程读写
+    bool recvArmed = false;
+    // 已经发过取消、等那条 recv 结束就提交真正的 close（关闭流程的第二步）
+    bool closePending = false;
 
     ConnCtx(OpType status, int fd)
             : status(status), id(0), fd(fd), task(std::nullopt) {}
 };
+
+// 累积缓冲超限时用它入队（复用标准 errno：消息过长）。recv 本身不会返回这个码，
+// 所以协程看到它就知道是自己这一侧判断出来的"请求太大"，该回 413
+static constexpr int32_t kReadTooLarge = -EMSGSIZE;
 
 // 连接空闲超时：服务器在等客户端（等读或等写）超过这个时长就把连接回收。
 // 没有这道闸，一个连上却不发数据的客户端会永久占住 fd 和缓冲池里的一块 buffer
@@ -92,8 +111,9 @@ static struct io_uring_sqe* acquireSqe(struct io_uring& ring) {
 
 // ── IouringAwaiter ───────────────────────────────────────────
 // co_await 挂起时向 io_uring 提交对应的 IO 请求，完成事件到达后由事件循环恢复协程。
-// 读方向的缓冲区由内核从 buffer ring 里挑（提交时只声明 buffer group，不给地址），
-// 写方向仍取连接自己的 writeBuffer；
+// 只管"要提交一条 IO 才有的等"：写响应（send，含短写续传）和收尾（close）。
+// 读方向已经改用 multishot recv（一次武装、持续产 CQE），挂起等数据走 WaitDataAwaiter，
+// 从这儿提交读会变成"同一 fd 上两条在途 recv"。
 // 同样只弱引用连接
 struct Server::IouringAwaiter {
     Server*                server;
@@ -115,18 +135,47 @@ struct Server::IouringAwaiter {
                      (int)conn->status, conn->fd, (void*)h.address());
 
         switch (conn->status) {
-            case OpType::READ:
-                server->submitRecv(conn->fd, *conn);
-                break;
             case OpType::WRITE:
                 server->submitWrite(conn->fd, conn->writeBuffer, *conn);
                 break;
             case OpType::CLOSE:
                 server->submitClose(conn->fd, *conn);
                 break;
+            case OpType::READ:
+                // 走到这里说明有人拿 IouringAwaiter 当"等数据"用了。真提交的话
+                // 会在同一条 fd 上再插一条 recv，而 multishot 那条还在——所以只报错
+                LOGGER_ERROR("IouringAwaiter used for READ fd={}, expected WaitDataAwaiter",
+                             conn->fd);
+                break;
             default:
                 break;
         }
+    }
+    void await_resume() const noexcept {}
+};
+
+// ── WaitDataAwaiter ──────────────────────────────────────────
+// 挂起等数据。读方向是 multishot recv，一次武装之后就一直在跑，所以这里
+// **什么都不提交**，只把 handle 记下来，等 handleCqe 把读结果入队后唤醒。
+//
+// 唤醒由 ConnCtx::awaitingRead 把门：await_suspend 返回后协程就彻底停下了，
+// 期间到达的读事件只会入队；handleCqe 看到这个标志为 true 才 resume。
+// 反过来，协程正忙时（比如挂在 send 上）到达的读事件既不丢也不误唤醒
+struct Server::WaitDataAwaiter {
+    Server*                server;
+    std::weak_ptr<ConnCtx> connWeak;
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> h) {
+        auto conn = connWeak.lock();
+        if (!conn) return;                     // 连接已回收，没有协程要恢复
+        conn->handle = h;
+        // 和 IouringAwaiter 一样：记下"从此刻起在等客户端"，空闲扫描据此判定超时
+        const int64_t since = nowMs();
+        conn->waitingSince.store(since, std::memory_order_relaxed);
+        conn->waiting.store(true, std::memory_order_release);
+        server->noteWaitStart(since);
+        LOGGER_TRACE("await_suspend(WaitData): fd={} handle={}",
+                     conn->fd, (void*)h.address());
     }
     void await_resume() const noexcept {}
 };
@@ -300,6 +349,9 @@ void Server::handleCqe(uint64_t tag, int res, unsigned cflags) {
             // 先登记进表拿到连接 id，协程 resume 后提交 IO 才有合法的标签可用
             const uint64_t newId = registerConn(ctx);
             LOGGER_INF("New connection fd={} id={}", newFd, newId);
+            // 在让协程跑起来之前先把 multishot recv 武装上：此后 CQE 会自己来，
+            // 数据到得比协程挂起还早也没关系——handleCqe 会入队，协程自己会取
+            submitRecv(newFd, *ctx);
             ctx->task.value().resume();
         } else {
             LOGGER_ERROR("Accept error: {}", res);
@@ -364,15 +416,14 @@ void Server::handleCqe(uint64_t tag, int res, unsigned cflags) {
     // 因为连接已被决定关闭而被误当成 close 完成来处理
     switch (op) {
         case OpType::READ: {
-            // res < 0：读失败，或被 IORING_OP_ASYNC_CANCEL 取消（-ECANCELED）
-            conn->bytes_read = res;
-
-            // 池里一块空闲 buffer 都没有了：内核这次没得可挑（-ENOBUFS），
-            // 也就不带 buffer id，池里一块都没少。不能就这么恢复协程——那会立刻
-            // 再提交一条 recv、再失败，把事件循环空转成 100% CPU。
-            // 把它挂进等待队列，等谁归还了 buffer 再去重投（见 resumeStarved）
+            // 池里一块空闲 buffer 都没有：multishot recv 就此结束（这条 CQE 不带
+            // F_MORE），这次也没挑到 buffer、池里一块都没少。不能就这么重新武装——
+            // 池还是空的，会立刻再失败，把事件循环空转成 100% CPU。挂进等待队列，
+            // 等谁归还了 buffer 再由 resumeStarved 重新武装；协程继续原地等数据，
+            // 不必惊动它
             if (res == -ENOBUFS) {
                 conn->waitingBuffer = true;
+                conn->recvArmed     = false;   // multishot 就此结束，等重新武装
                 // 这一次完成事件没有带回数据，连接其实还在等（等池里的 buffer），
                 // 把等待标志放回去，让空闲超时照旧管着它
                 conn->waiting.store(true, std::memory_order_release);
@@ -381,24 +432,53 @@ void Server::handleCqe(uint64_t tag, int res, unsigned cflags) {
                 break;
             }
 
-            // 内核这次从池里挑走了哪一块：buffer id 在 CQE flags 的高 16 位。
-            // 无论 res 是正数、0（对端关闭）还是负数（读错误 / 被取消），
-            // 只要带了这个标志，池里就少了一块，必须记下来等着归还——
-            // 归还的唯一凭证就是它，丢了就等于永久漏掉一块 buffer
+            // 数据先搬进连接的解析器，再立刻把这块 buffer 还回池子。
+            // 顺序不能反：还回去之后内核马上可能把它交给别的连接，而解析器要跨
+            // 多次 recv 累积，不能依赖池里那块内存。buffer id 在 CQE flags 高 16 位
             if (cflags & IORING_CQE_F_BUFFER) {
-                conn->readBufId  = static_cast<uint16_t>(cflags >> IORING_CQE_BUFFER_SHIFT);
-                conn->readBufPtr = static_cast<const char*>(mBufPool)
-                                 + static_cast<size_t>(conn->readBufId) * kBufSize;
+                const uint16_t bid = static_cast<uint16_t>(cflags >> IORING_CQE_BUFFER_SHIFT);
+                if (res > 0) {
+                    conn->parser.feed(static_cast<const char*>(mBufPool)
+                                      + static_cast<size_t>(bid) * kBufSize,
+                                      static_cast<size_t>(res));
+                }
+                putBackReadBuffer(bid);
             }
 
-            if (!conn->handle || conn->handle.done()) {
-                // 没有协程来消费这块数据了：必须在这儿把 buffer 还回去，
-                // 否则池子会随着这类连接慢慢漏干，最后所有新连接都读不到数据
-                putBackReadBuffer(*conn);
-                submitClose(conn->fd, *conn);
-                break;
+            // 入队这次读的结果。累积超限的话，这条连接已经不可能被解析出完整请求了，
+            // 换成一个"请求太大"的结束码，让协程去回 413
+            conn->pendingReads.push_back(conn->parser.overflowed() ? kReadTooLarge
+                                                                   : static_cast<int32_t>(res));
+
+            // 只有协程确实挂在"等数据"上才唤醒它。否则它正忙（比如挂在 send 上等
+            // 写完），这一条只入队，等它自己回到循环来取——不在错误的状态下 resume。
+            // 单线程下 exchange 不是必需的，但用它可以顺带报告"这次有没有真的唤醒人"
+            if (conn->awaitingRead.exchange(false, std::memory_order_acq_rel)) {
+                if (!conn->handle || conn->handle.done()) {
+                    // 没有协程来收尾了（正常路径不该出现：能挂在这里就说明协程活着）
+                    LOGGER_WARN("No coroutine to wake fd={} id={}, closing", conn->fd, conn->id);
+                    submitClose(conn->fd, *conn);
+                } else {
+                    conn->handle.resume();
+                }
             }
-            conn->handle.resume();
+
+            // 没有 F_MORE 说明 multishot 结束了。原因只有三种，上面都已经落定：
+            // -ENOBUFS 挂进了等待队列等重新武装、EOF 和错误则已经把负值/0 入了队，
+            // 协程取到会自己走关闭流程。这里只补一件事：把"有 recv 在途"的记号清掉，
+            // 并看看是不是有人在等这个时机才肯 close
+            if (!(cflags & IORING_CQE_F_MORE)) {
+                LOGGER_TRACE("recv multishot ended fd={} id={} res={}", conn->fd, conn->id, res);
+                conn->recvArmed = false;
+                if (conn->closePending) {
+                    // 关闭流程的第二步：这条 recv 已经结束、socket 引用放下了，
+                    // 现在提交 close 才能真正关掉 socket 并把 FIN 发出去
+                    conn->closePending = false;
+                    LOGGER_TRACE("recv drained, submitting deferred close fd={} id={}",
+                                 conn->fd, conn->id);
+                    submitCloseNow(conn->fd, *conn);
+                }
+            }
             break;
         }
         case OpType::WRITE: {
@@ -438,10 +518,8 @@ void Server::handleCqe(uint64_t tag, int res, unsigned cflags) {
             // （那条多余的 close 会打在可能已被内核复用给新连接的 fd 号上）。
             // 协程帧随 ConnCtx 析构时由 task 一并销毁，帧内对象的析构照常发生
             //
-            // 兜底归还：正常路径上每块 buffer 都在协程 resume 后的那一小段里还掉了
-            // （没有挂起点能把它漏过去），所以这里读到的应该是 kNoBufId、直接返回。
-            // 留着这一手只因为漏还一块是静默的——池子不会报错，只会慢慢变少
-            putBackReadBuffer(*conn);
+            // 这里不再需要兜底归还 buffer：读方向的 buffer 在 handleCqe 里就 feed 完
+            // 并还掉了，生命周期不跨出那一段，连接上根本没有"占着没还"的凭证
             unregisterConn(connId);
             break;
         }
@@ -530,9 +608,12 @@ void Server::scanIdle() {
         // 否则它会一直躺在等待队列里，永远等不到那条本该唤醒它的 CQE
         if (conn->waitingBuffer) {
             conn->waitingBuffer = false;
-            conn->bytes_read    = -ECANCELED;
             LOGGER_INF("Connection idle timeout while waiting for buffer, waking fd={} id={}",
                        conn->fd, conn->id);
+            // 统一走队列：把取消码送进去再唤醒，协程从那儿按正常路径收尾。
+            // 这类连接身上没有在途请求，ASYNC_CANCEL 没有东西可取消（它上一条 recv
+            // 以 -ENOBUFS 结束，池里一块都没少），所以只能这么叫醒它
+            conn->pendingReads.push_back(-ECANCELED);
             if (conn->handle && !conn->handle.done()) {
                 conn->handle.resume();
             } else {
@@ -559,7 +640,7 @@ void Server::scanIdle() {
         //
         // 全程不改 status：status 只表达"协程下一步想提交什么 IO"，
         // 谁是"正在关闭"由 CLOSE 这条 CQE 自己说清楚
-        if (!cancelInFlight(*conn)) {
+        if (!cancelInFlight(*conn, conn->status)) {
             // 提交队列实在挤不出位置：把等待标志放回去，下一轮扫描再试
             conn->waiting.store(true, std::memory_order_release);
         }
@@ -572,15 +653,15 @@ void Server::noteWaitStart(int64_t since) {
     if (since < mOldestWaitSince) mOldestWaitSince = since;
 }
 
-// 取消某条连接上那条在途请求（按 user_data 精确匹配，即按 (操作类型, 连接 id)）。
+// 取消某条连接上那条在途请求，按 (操作类型, 连接 id) 精确匹配。
 // cancel 自己的完成事件用 (CANCEL, id) 作标签，在 handleCqe 里被直接放过
-bool Server::cancelInFlight(const ConnCtx& connCtx) {
+bool Server::cancelInFlight(const ConnCtx& connCtx, OpType op) {
     struct io_uring_sqe* sqe = acquireSqe(ring);
     if (!sqe) {
         LOGGER_ERROR("cancelInFlight: SQ full, fd={} id={}", connCtx.fd, connCtx.id);
         return false;
     }
-    io_uring_prep_cancel64(sqe, packTag(connCtx.status, connCtx.id), 0);
+    io_uring_prep_cancel64(sqe, packTag(op, connCtx.id), 0);
     io_uring_sqe_set_data64(sqe, packTag(OpType::CANCEL, connCtx.id));
     return true;
 }
@@ -648,15 +729,11 @@ void Server::freeBufRing() {
     }
 }
 
-// 把这次 recv 占用的那块 buffer 还给池子。
+// 把一块 provided buffer 还给池子。凭证是完成事件带回来的 buffer id，
 // 调用点必须保证数据已经离开这块内存（feed 进解析器时拷了一份）——归还之后
-// 内核立刻就可能把它交给别的连接的 recv，晚一步就是数据被盖掉
-void Server::putBackReadBuffer(ConnCtx& connCtx) {
-    if (connCtx.readBufId == kNoBufId) return;   // 这次没占着（比如 -ENOBUFS）
-
-    const uint16_t bid = connCtx.readBufId;
-    connCtx.readBufId  = kNoBufId;               // 先清凭证：同一块不会被还两次
-    connCtx.readBufPtr = nullptr;
+// 内核立刻就可能把它交给别的连接，晚一步就是数据被盖掉
+void Server::putBackReadBuffer(uint16_t bid) {
+    if (bid == kNoBufId) return;                 // 这次没占着（比如 -ENOBUFS）
 
     io_uring_buf_ring_add(mBufRing,
                           static_cast<char*>(mBufPool) + static_cast<size_t>(bid) * kBufSize,
@@ -738,12 +815,16 @@ void Server::submitRecv(int fd, ConnCtx& connCtx) {
         submitClose(fd, connCtx);
         return;
     }
-    // 不自己给地址：buf=NULL + len=0 配上 IOSQE_BUFFER_SELECT，等于告诉内核
-    // "从 bgid 这个池里挑一块空闲的填进去"。挑中的那块以 buffer id 的形式随完成
-    // 事件回来（CQE flags 高 16 位），那是归还它、把内存还给池子的唯一凭证
-    io_uring_prep_recv(sqe, fd, nullptr, 0, 0);
+    // multishot recv：提交一次就一直在跑，之后每次有数据都自己产一条 CQE
+    // （带 IORING_CQE_F_MORE），不需要逐次重投。它必须配 provided buffer 用——
+    // buf=NULL + len=0 + IOSQE_BUFFER_SELECT 等于告诉内核"从 bgid 这个池里挑一块
+    // 空闲的填进去"，挑中的那块以 buffer id 的形式随 CQE 回来（flags 高 16 位），
+    // 那是归还它、把内存还给池子的唯一凭证
+    io_uring_prep_recv_multishot(sqe, fd, nullptr, 0, 0);
     sqe->flags |= IOSQE_BUFFER_SELECT;
     sqe->buf_group = static_cast<uint16_t>(kBufGroup);
+    // 记下"这条 fd 上有一条 recv 在途"：关闭前必须先让它结束（见 submitClose）
+    connCtx.recvArmed = true;
     // 标签带操作类型：这条 recv 的完成事件以后只会走 READ 分支，
     // 跟这条连接此后是不是被决定关闭没有关系
     io_uring_sqe_set_data64(sqe, packTag(OpType::READ, connCtx.id));
@@ -765,6 +846,30 @@ void Server::submitWrite(int fd, std::string& msg, ConnCtx& connCtx) {
 }
 
 void Server::submitClose(int fd, ConnCtx& connCtx) {
+    // 读方向还武装着一条 multishot recv，它是唯一握着 socket 引用的东西：
+    // 此刻直接 close 只是把 fd 从表里摘掉，socket 还活着，FIN 根本发不出去，
+    // 客户端会一直等（这正是 README 里 shutdown+close 那个坑的 multishot 版本，
+    // 而且 multishot recv 会一直武装，所以每次关闭都会踩到）。
+    //
+    // 所以先把它取消掉，真正的 close 留到它自己的完成事件里做——那一刻请求已经
+    // 结束、引用才真正释放（见 handleCqe 的 READ 分支里对 closePending 的处理）。
+    // 顺序不能换成"cancel 完后紧接着 close"：cancel 的完成只说明目标被取消了，
+    // 不等它自己的 CQE 回来，引用可能还没放下
+    if (connCtx.recvArmed) {
+        connCtx.recvArmed    = false;
+        connCtx.closePending = true;
+        if (!cancelInFlight(connCtx, OpType::READ)) {
+            // 连取消都提交不出去（SQ 满）：只能退回同步 close 兜底，别把 fd 漏了
+            LOGGER_WARN("submitClose: cannot cancel in-flight recv, force close fd={}", fd);
+            connCtx.closePending = false;
+            ::close(fd);
+        }
+        return;
+    }
+    submitCloseNow(fd, connCtx);
+}
+
+void Server::submitCloseNow(int fd, ConnCtx& connCtx) {
     struct io_uring_sqe* sqe = acquireSqe(ring);
     if (!sqe) {
         LOGGER_ERROR("submitClose: SQ full, force close fd={}", fd);
@@ -793,7 +898,6 @@ void Server::submitEventFdRead() {
 }
 
 coro::Task<void> Server::clientConnect(std::weak_ptr<ConnCtx> connWeak) {
-    HttpParser   httpParser;
     HttpResponse httpResponse;
 
     // 本协程内部用裸指针：连接持有这个协程帧，所以只要本协程在跑，连接就一定活着
@@ -809,81 +913,135 @@ coro::Task<void> Server::clientConnect(std::weak_ptr<ConnCtx> connWeak) {
 
     bool shouldClose = false;
 
+    // 解析器挂在连接上（ConnCtx::parser）：字节搬运由 handleCqe 做（好让那块 buffer
+    // 立刻还回池子），从里面切请求留在这里——因为切出来之后要路由、要执行 handler、
+    // 要写响应，这些都得能挂起，而 handleCqe 是普通函数
+    HttpParser& httpParser = connState->parser;
+
     while (!shouldClose) {
-        connState->status     = OpType::READ;
-        connState->bytes_read = 0;
-        connState->handle     = nullptr;
-        co_await IouringAwaiter{this, connWeak};
-
-        ssize_t n = connState->bytes_read;
-
-        // 数据落在内核刚从池里挑中的那块 buffer 上（地址在 readBufPtr）。
-        // 先拷进解析器（feed 内部 append 了一份），再归还——归还意味着这块内存
-        // 立刻可能被别的连接的 recv 写进来，所以这个指针绝不允许跨过任何挂起点。
-        // 数据可能不足一个完整请求，那没关系：解析器自己累积（见 HttpParser::buf_）
-        if (n > 0 && connState->readBufPtr != nullptr) {
-            httpParser.feed(connState->readBufPtr, static_cast<size_t>(n));
-        }
-        // 无论读成功、对端关闭还是出错，都在这里把 buffer 还给池子。
-        // 归还凭证是 readBufId（完成事件的 CQE flags 带回来的），由它反算出地址
-        putBackReadBuffer(*connState);
-
-        if (n <= 0) {
-            if (n == -ECANCELED) {
-                // 空闲超时扫描用 IORING_OP_ASYNC_CANCEL 取消了这条在途 recv：
-                // 属于正常回收路径，不是读错误
-                LOGGER_INF("Read cancelled by idle scan fd={}", connState->fd);
-            } else if (n < 0) {
-                LOGGER_ERROR("Read error fd={} err={}", connState->fd, n);
-            } else {
-                LOGGER_INF("Client closed fd={}", connState->fd);
+        // 队列空 → 停下：置"在等数据"标志后挂起。读方向是 multishot recv，
+        // 一次武装后一直在跑，这里不需要提交任何 IO
+        if (connState->pendingReads.empty()) {
+            // status 摆回 READ：空闲超时要取消的就是这条 multishot recv，
+            // cancelInFlight 按 (操作类型, 连接 id) 匹配，这里得对得上
+            connState->status = OpType::READ;
+            connState->awaitingRead.store(true, std::memory_order_release);
+            // 置标志到真正挂起之间不会有 CQE 被处理（单线程），复查一次只是稳妥：
+            // 万一队列里已经有东西了，就别挂起，直接接着消费
+            if (connState->pendingReads.empty()) {
+                co_await WaitDataAwaiter{this, connWeak};
             }
-            break;
+            connState->awaitingRead.store(false, std::memory_order_release);
+            continue;
         }
 
-        if (auto optReq = httpParser.try_parse()) {
-                HttpRequest& req = *optReq;
+        // 队列非空 → 继续：把已经落地的读结果全部消费掉
+        while (!connState->pendingReads.empty() && !shouldClose) {
+            const int32_t n = connState->pendingReads.front();
+            connState->pendingReads.pop_front();
+
+            if (n == kReadTooLarge) {
+                // 累积超过 HttpParser::kMaxBufferSize：解析器已经不再收新数据，
+                // 这条连接不可能再切出请求了，回一个 413 收尾
+                LOGGER_WARN("Request too large fd={} limit={}", connState->fd,
+                            HttpParser::kMaxBufferSize);
                 httpResponse = HttpResponse();
-
-                // 路由匹配（精确 + 前缀）由 Router 负责，执行分两条路径：
-                //   同步快路径（默认）：handler 直接在事件循环线程执行，零调度开销
-                //   异步慢路径：Route::async 时经 QueryAwaiter 投全局线程池，防阻塞
-                bool hit = false;
-                Router::Route route;
-                if (mRouter.match(req, route)) {
-                    if (route.async) {
-                        HttpRequest  reqSnap = req;
-                        auto resSnap = std::make_shared<HttpResponse>();
-                        co_await QueryAwaiter{this, connWeak,
-                                              [handler = route.handler, reqSnap = std::move(reqSnap), resSnap]() mutable {
-                                                  handler(reqSnap, *resSnap);
-                                              }
-                        };
-                        httpResponse = std::move(*resSnap);
-                    } else {
-                        route.handler(req, httpResponse);   // 同步快速路径
-                    }
-                    hit = true;
-                }
-
-                if (!hit) {
-                    httpResponse.set_status(404).set_body("Not Found");
-                }
-
-                std::string connHdr = req.get_header_value("connection");
-                HttpUtils::to_lower(connHdr);
-                bool keepAlive = (connHdr != "close");
-                httpResponse.set_header("Connection", keepAlive ? "keep-alive" : "close");
-
+                httpResponse.set_status(413)
+                            .set_header("Connection", "close")
+                            .set_body("Payload Too Large");
                 connState->status      = OpType::WRITE;
                 connState->writeBuffer = httpResponse.build();
                 connState->handle      = nullptr;
                 co_yield IouringAwaiter{this, connWeak};
+                shouldClose = true;
+                break;
+            }
 
-                if (!keepAlive) {
-                    shouldClose = true;
+            if (n <= 0) {
+                if (n == -ECANCELED) {
+                    // 空闲超时扫描用 IORING_OP_ASYNC_CANCEL 取消了这条在途 recv：
+                    // 属于正常回收路径，不是读错误
+                    LOGGER_INF("Read cancelled by idle scan fd={}", connState->fd);
+                } else if (n < 0) {
+                    LOGGER_ERROR("Read error fd={} err={}", connState->fd, n);
+                } else {
+                    LOGGER_INF("Client closed fd={}", connState->fd);
                 }
-        } // if 结束
+                shouldClose = true;
+                break;
+            }
+
+            // 把解析器里已经完整的请求全部处理掉。一次 recv 可能带回多个请求
+            // （粘包 / pipelining），只处理一个的话其余的会一直压到下一次 recv 才有机会
+            bool malformed = false;
+            try {
+                while (auto optReq = httpParser.try_parse()) {
+                    HttpRequest& req = *optReq;
+                    httpResponse = HttpResponse();
+
+                    // 路由匹配（精确 + 前缀）由 Router 负责，执行分两条路径：
+                    //   同步快路径（默认）：handler 直接在事件循环线程执行，零调度开销
+                    //   异步慢路径：Route::async 时经 QueryAwaiter 投全局线程池，防阻塞
+                    bool hit = false;
+                    Router::Route route;
+                    if (mRouter.match(req, route)) {
+                        if (route.async) {
+                            HttpRequest  reqSnap = req;
+                            auto resSnap = std::make_shared<HttpResponse>();
+                            co_await QueryAwaiter{this, connWeak,
+                                                  [handler = route.handler, reqSnap = std::move(reqSnap), resSnap]() mutable {
+                                                      handler(reqSnap, *resSnap);
+                                                  }
+                            };
+                            httpResponse = std::move(*resSnap);
+                        } else {
+                            route.handler(req, httpResponse);   // 同步快速路径
+                        }
+                        hit = true;
+                    }
+
+                    if (!hit) {
+                        httpResponse.set_status(404).set_body("Not Found");
+                    }
+
+                    std::string connHdr = req.get_header_value("connection");
+                    HttpUtils::to_lower(connHdr);
+                    bool keepAlive = (connHdr != "close");
+                    httpResponse.set_header("Connection", keepAlive ? "keep-alive" : "close");
+
+                    connState->status      = OpType::WRITE;
+                    connState->writeBuffer = httpResponse.build();
+                    connState->handle      = nullptr;
+                    co_yield IouringAwaiter{this, connWeak};
+
+                    if (!keepAlive) {
+                        shouldClose = true;
+                        break;
+                    }
+                }
+            } catch (const std::exception& e) {
+                // 畸形请求：HttpParser 对坏的请求行 / Content-Length / chunk size
+                // 都会抛。以前这里没人接，异常直接结束协程——而"协程结束"不等于
+                // "连接被关闭"：没人提交 close，fd 和连接表条目就这么漏下了。
+                // 记下来，出去回一个 400 再走正常关闭流程
+                // （co_yield 不能写在 catch 里，C++ 不允许 handler 中出现 await）
+                LOGGER_WARN("Malformed request fd={}: {}", connState->fd, e.what());
+                malformed = true;
+            }
+
+            if (malformed) {
+                httpResponse = HttpResponse();
+                httpResponse.set_status(400)
+                            .set_header("Connection", "close")
+                            .set_body("Bad Request");
+                connState->status      = OpType::WRITE;
+                connState->writeBuffer = httpResponse.build();
+                connState->handle      = nullptr;
+                co_yield IouringAwaiter{this, connWeak};
+                shouldClose = true;
+                break;
+            }
+        }
     }
 
     connState->status = OpType::CLOSE;
